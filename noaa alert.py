@@ -80,6 +80,7 @@ class NOAAForecast:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels above 6 detected!")
         else:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels are normal.")
+            self.post_to_discord("Kp levels are normal.", forecast_text)
 
 
 if __name__ == "__main__":
