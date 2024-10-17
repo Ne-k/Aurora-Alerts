@@ -13,9 +13,11 @@ class NOAAForecast:
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
 
     def fetch_forecast(self):
-        response = requests.get(self.url)
-        response.raise_for_status()
-        return response.text
+        with(open('forecastExample.txt', 'r')) as f:
+            return f.read()
+        # response = requests.get(self.url)
+        # response.raise_for_status()
+        # return response.text
 
     def post_to_discord(self, message, file_content):
         data = {"content": message}
@@ -29,15 +31,15 @@ class NOAAForecast:
         if not kp_section:
             return False
 
-        # Extract times and Kp values using regex
         times_pattern = re.compile(r'(\d+-\d+UT)')
         kp_values_pattern = re.compile(r'(\d+\.\d+)')
         times = times_pattern.findall(kp_section.group())
         kp_levels = kp_values_pattern.findall(kp_section.group())
         kp_levels = [float(kp) for kp in kp_levels]
 
-        # Extract days dynamically
-        days_pattern = re.compile(r'\bOct \d{1,2}\b')
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        months_pattern = "|".join(months)
+        days_pattern = re.compile(rf'\b(?:{months_pattern}) \d{{1,2}}\b')
         days = days_pattern.findall(forecast_text)
 
         if len(days) < 3 or len(times) < 8:
