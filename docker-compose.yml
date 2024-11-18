@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  noaa_alert:
+    build: .
+    volumes:
+      - .:/app
+    entrypoint: ["cron", "-f"]
+    environment:
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+    command: >
+      bash -c "echo '0 8,20 * * * root python /app/noaa%20alert.py >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
+               chmod 0644 /etc/cron.d/noaa_alert &&
+               crontab /etc/cron.d/noaa_alert &&
+               touch /var/log/cron.log &&
+               cron && tail -f /var/log/cron.log"
