@@ -13,11 +13,11 @@ class NOAAForecast:
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
 
     def fetch_forecast(self):
-        with(open('forecastExample.txt', 'r')) as f:
-            return f.read()
-        # response = requests.get(self.url)
-        # response.raise_for_status()
-        # return response.text
+        # with(open('forecastExample.txt', 'r')) as f:
+        #     return f.read()
+        response = requests.get(self.url)
+        response.raise_for_status()
+        return response.text
 
     def post_to_discord(self, message, file_content):
         data = {"content": message}
