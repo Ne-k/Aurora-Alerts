@@ -4,7 +4,7 @@ services:
   noaa_alert:
     build: .
     volumes:
-      - .:/app
+      - /home/nguyen/NOAA-Aurora-Alerts:/app
     entrypoint: ["cron", "-f"]
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
