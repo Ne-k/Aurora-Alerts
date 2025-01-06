@@ -13,5 +13,5 @@ services:
       chmod 0644 /etc/cron.d/noaa_alert &&
       crontab /etc/cron.d/noaa_alert &&
       touch /var/log/cron.log &&
-      cron && tail -f /var/log/cron.log
+      cron -f
     restart: always
