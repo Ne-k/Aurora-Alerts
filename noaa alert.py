@@ -13,11 +13,11 @@ class NOAAForecast:
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
 
     def fetch_forecast(self):
-        # with(open('forecastExample.txt', 'r')) as f:
-        #     return f.read()
-        response = requests.get(self.url)
-        response.raise_for_status()
-        return response.text
+        with(open('forecastExample.txt', 'r')) as f:
+            return f.read()
+        # response = requests.get(self.url)
+        # response.raise_for_status()
+        # return response.text
 
     def post_to_discord(self, message, file_content):
         data = {"content": message}
@@ -54,7 +54,7 @@ class NOAAForecast:
                 above_6_info.append((day, time, kp))
 
         if above_6_info:
-            message = "```Kp levels above 6 detected on:\n"
+            message = "```### **(This is fake and not real because I want to test of ts works or not)** Kp levels above 6 detected on:\n"
             message += "╔═══════════════════════════════════════════════════╗\n"
             for info in above_6_info:
                 day, time, kp = info
