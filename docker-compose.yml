@@ -14,4 +14,4 @@ services:
       crontab /etc/cron.d/noaa_alert &&
       touch /var/log/cron.log &&
       cron -f
-    restart: always
+#    restart: always
