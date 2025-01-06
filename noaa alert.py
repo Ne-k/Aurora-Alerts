@@ -4,6 +4,7 @@ from datetime import datetime
 import pytz
 from dotenv import load_dotenv
 import os
+import sys
 
 
 class NOAAForecast:
@@ -13,8 +14,6 @@ class NOAAForecast:
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
 
     def fetch_forecast(self):
-        # with(open('forecastExample.txt', 'r')) as f:
-        #     return f.read()
         response = requests.get(self.url)
         response.raise_for_status()
         return response.text
@@ -45,18 +44,18 @@ class NOAAForecast:
         if len(days) < 3 or len(times) < 8:
             return False
 
-        # Check for Kp levels above 6
-        above_6_info = []
+        # Check for Kp levels
+        kp_info = []
         for i, kp in enumerate(kp_levels):
-            if kp >= 6:
-                day = days[i // 8]
-                time = times[i % 8]
-                above_6_info.append((day, time, kp))
+            day = days[i // 8]
+            time = times[i % 8]
+            kp_info.append((day, time, kp))
 
-        if above_6_info:
-            message = "```\Kp levels above 6 detected on:\n"
+        if kp_info:
+            message = "```\Aurora 3 Day Kp Forecast:\n"
+            message += "Kp levels above 6 detected on:\n"
             message += "╔═══════════════════════════════════════════════════╗\n"
-            for info in above_6_info:
+            for info in kp_info:
                 day, time, kp = info
                 start_hour = int(time.split('-')[0])
                 end_hour = int(time.split('-')[1][:2])
@@ -78,8 +77,49 @@ class NOAAForecast:
 
     def main(self):
         forecast_text = self.fetch_forecast()
-        if self.check_kp_levels(forecast_text):
-            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels above 6 detected!")
+        override = len(sys.argv) > 1 and sys.argv[1] == "override"
+        if override or self.check_kp_levels(forecast_text):
+            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels detected or override flag used!")
+            if override:
+                message = "```\Aurora 3 Day Kp Forecast:\n"
+                message += "╔═══════════════════════════════════════════════════╗\n"
+                kp_section_pattern = re.compile(r'NOAA Kp index breakdown.*?(?=Rationale:)', re.DOTALL)
+                kp_section = kp_section_pattern.search(forecast_text)
+                if kp_section:
+                    times_pattern = re.compile(r'(\d+-\d+UT)')
+                    kp_values_pattern = re.compile(r'(\d+\.\d+)')
+                    times = times_pattern.findall(kp_section.group())
+                    kp_levels = kp_values_pattern.findall(kp_section.group())
+                    kp_levels = [float(kp) for kp in kp_levels]
+
+                    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    months_pattern = "|".join(months)
+                    days_pattern = re.compile(rf'\b(?:{months_pattern}) \d{{1,2}}\b')
+                    days = days_pattern.findall(forecast_text)
+
+                    if len(days) >= 3 and len(times) >= 8:
+                        kp_info = []
+                        for i, kp in enumerate(kp_levels):
+                            day = days[i // 8]
+                            time = times[i % 8]
+                            kp_info.append((day, time, kp))
+
+                        for info in kp_info:
+                            day, time, kp = info
+                            start_hour = int(time.split('-')[0])
+                            end_hour = int(time.split('-')[1][:2])
+                            utc = pytz.utc
+                            pst = pytz.timezone('US/Pacific')
+                            start_time_utc = utc.localize(datetime.strptime(f"{day} {start_hour}", "%b %d %H"))
+                            end_time_utc = utc.localize(datetime.strptime(f"{day} {end_hour}", "%b %d %H"))
+                            start_time_pst = start_time_utc.astimezone(pst)
+                            end_time_pst = end_time_utc.astimezone(pst)
+                            message += f"║ Day: {day}, Time: {start_time_pst.strftime('%I:%M %p')} - {end_time_pst.strftime('%I:%M %p')} PST, Kp level: {kp:.2f} ║\n"
+                message += "╚═══════════════════════════════════════════════════╝\n"
+                message += "```"
+                message += "\n[Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
+                message += "\n[Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
+                self.post_to_discord(message, forecast_text)
         else:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels are normal.")
             # self.post_to_discord("Kp levels are normal.", forecast_text)
