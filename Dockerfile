@@ -1,4 +1,3 @@
-# Dockerfile
 FROM python:3.11-slim
 
 # Install cron
@@ -11,4 +10,5 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
+# Start cron in the foreground
 CMD ["cron", "-f"]
