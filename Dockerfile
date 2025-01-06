@@ -1,5 +1,8 @@
 # Dockerfile
-FROM python:3.9-slim
+FROM python:3.11-slim
+
+# Install cron
+RUN apt-get update && apt-get install -y cron
 
 WORKDIR /app
 
@@ -8,4 +11,4 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-CMD ["python", "noaa%20alert.py"]
+CMD ["cron", "-f"]
