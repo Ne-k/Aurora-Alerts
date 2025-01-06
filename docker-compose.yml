@@ -9,7 +9,6 @@ services:
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
     command: >
-      echo 'Container started at $$(date)' &&
       echo '0 8,20 * * * root python /app/noaa%20alert.py >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
       chmod 0644 /etc/cron.d/noaa_alert &&
       crontab /etc/cron.d/noaa_alert &&
