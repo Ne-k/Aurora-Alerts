@@ -47,7 +47,7 @@ class NOAAForecast:
         # Check for Kp levels above 6
         above_6_info = []
         for i, kp in enumerate(kp_levels):
-            if kp >= 6:
+            if kp > 6:
                 day = days[i // 8]
                 time = times[i % 8]
                 above_6_info.append((day, time, kp))
