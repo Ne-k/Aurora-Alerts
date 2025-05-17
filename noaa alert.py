@@ -1,10 +1,10 @@
-import requests
+import os
 import re
 from datetime import datetime
+
 import pytz
+import requests
 from dotenv import load_dotenv
-import os
-import sys
 
 
 class NOAAForecast:
@@ -18,9 +18,16 @@ class NOAAForecast:
         response.raise_for_status()
         return response.text
 
-    def post_to_discord(self, message, file_content):
+    def post_to_discord(self, message, file_content, tonight_forecast_content=None, tomorrow_forecast_content=None):
         data = {"content": message}
-        files = {'file': ('forecast.txt', file_content)}
+        files = {
+            'file': ('forecast.txt', file_content)
+        }
+        if tonight_forecast_content:
+            files['tonight_forecast.png'] = ('tonight_forecast.png', tonight_forecast_content)
+        if tomorrow_forecast_content:
+            files['tomorrow_forecast.png'] = ('tomorrow_forecast.png', tomorrow_forecast_content)
+
         response = requests.post(self.discord_webhook, data=data, files=files)
         response.raise_for_status()
 
@@ -44,16 +51,21 @@ class NOAAForecast:
         if len(days) < 3 or len(times) < 8:
             return False
 
-        # Check for Kp levels above 6
         above_6_info = []
         for i, kp in enumerate(kp_levels):
-            if kp > 6:
+            if kp >= 7:
                 day = days[i // 8]
                 time = times[i % 8]
                 above_6_info.append((day, time, kp))
 
         if above_6_info:
-            message = "```\Kp levels above 6 detected on:\n"
+            tonight_forecast_url = "https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png"
+            tomorrow_forecast_url = "https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png"
+
+            tonight_forecast = requests.get(tonight_forecast_url)
+            tomorrow_forecast = requests.get(tomorrow_forecast_url)
+            message = "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n"
+            message += "```Aurora kp levels above or equal to 7 detected on:\n"
             message += "╔═══════════════════════════════════════════════════╗\n"
             for info in above_6_info:
                 day, time, kp = info
@@ -67,10 +79,10 @@ class NOAAForecast:
                 end_time_pst = end_time_utc.astimezone(pst)
                 message += f"║ Day: {day}, Time: {start_time_pst.strftime('%I:%M %p')} - {end_time_pst.strftime('%I:%M %p')} PST, Kp level: {kp:.2f} ║\n"
             message += "╚═══════════════════════════════════════════════════╝\n"
-            message += "```"
-            message += "\n[Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
-            message += "\n[Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
-            self.post_to_discord(message, forecast_text)
+            # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
+            # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
+
+            self.post_to_discord(message, forecast_text, tonight_forecast.content, tomorrow_forecast.content)
             return True
         else:
             return False
