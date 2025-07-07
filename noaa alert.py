@@ -75,9 +75,11 @@ class NOAAForecast:
             message = "🌌 **AURORA ALERT**\n\n"
             message += f"Alert detected at: <t:{current_timestamp}:F>\n"
             message += f"Time: <t:{current_timestamp}:R>\n\n"
-            message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n"
-            message += "```Aurora kp levels above or equal to 6.5 detected on:\n"
-            message += "╔═══════════════════════════════════════════════════╗\n"
+            message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n\n"
+            message += "**Aurora kp levels above or equal to 6.5 detected on:**\n"
+            
+            # Collect all aurora info lines first to determine max width
+            aurora_lines = []
             for info in above_6_info:
                 day, time, kp = info
                 start_hour = int(time.split('-')[0])
@@ -94,12 +96,30 @@ class NOAAForecast:
                     start_discord_timestamp = int(start_time_utc.timestamp())
                     end_discord_timestamp = int(end_time_utc.timestamp())
                     
-                    message += f"║ Day: {day}, Time: <t:{start_discord_timestamp}:R> to <t:{end_discord_timestamp}:R> UTC, Kp level: {kp:.2f} ║\n"
+                    # Create line without Discord formatting for width calculation
+                    display_line = f"Day: {day}, Time: <t:{start_discord_timestamp}:R> to <t:{end_discord_timestamp}:R> UTC, Kp level: {kp:.2f}"
+                    # Estimate display width (Discord timestamps show as text)
+                    estimated_line = f"Day: {day}, Time: in X hours to in X hours UTC, Kp level: {kp:.2f}"
+                    aurora_lines.append((display_line, len(estimated_line)))
                 except ValueError:
                     # Fallback to original format if timestamp parsing fails
-                    message += f"║ Day: {day}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f} ║\n"
-            message += "╚═══════════════════════════════════════════════════╝\n"
-            message += "```\n"  # Close the code block
+                    display_line = f"Day: {day}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f}"
+                    aurora_lines.append((display_line, len(display_line)))
+            
+            # Find the maximum width needed
+            max_width = max(len(line[1]) if isinstance(line[1], str) else line[1] for line in aurora_lines) + 4  # Add padding
+            
+            # Create dynamic border
+            top_border = "╔" + "═" * max_width + "╗"
+            bottom_border = "╚" + "═" * max_width + "╝"
+            
+            message += f"```\n{top_border}\n"
+            for line, _ in aurora_lines:
+                # Calculate padding needed
+                estimated_display = line.replace('<t:', '').replace(':R>', ' in X hours')  # Rough estimate
+                padding = max_width - len(estimated_display)
+                message += f"║ {line}" + " " * padding + " ║\n"
+            message += f"{bottom_border}\n```\n"
             # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
             # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
 
@@ -136,8 +156,8 @@ class NOAAForecast:
                 # The check_kp_levels method will handle sending the full alert message
                 print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message sent with alert data!")
             else:
-                test_message += "```\nNo high Kp levels detected in test data\n```\n"
-                test_message += "ℹ️ Test completed - system is operational\n"
+                test_message += "**No high Kp levels detected in test data**\n"
+                test_message += "✅ Test completed - system is operational\n"
                 # Send a simple test message without attachments
                 data = {"content": test_message}
                 response = requests.post(self.discord_webhook, json=data)
