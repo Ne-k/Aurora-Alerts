@@ -4,7 +4,7 @@ services:
   noaa_alert:
     build: .
     volumes:
-      - /home/nguyen/NOAA-Aurora-Alerts:/app
+      - .:/app
     entrypoint: ["bash", "-c"]
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
@@ -21,7 +21,7 @@ services:
   noaa_alert_test:
     build: .
     volumes:
-      - /home/nguyen/NOAA-Aurora-Alerts:/app
+      - .:/app
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
       - TEST_WEBHOOK=${TEST_WEBHOOK}
