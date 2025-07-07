@@ -8,7 +8,7 @@ services:
     entrypoint: ["bash", "-c"]
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - TEST_WEBHOOK=${TEST_WEBHOOK}
+      - TEST_WEBHOOK=${DISCORD_WEBHOOK}
     command: >
       echo '0 8,20 * * * root python /app/noaa\ alert.py >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
       chmod 0644 /etc/cron.d/noaa_alert &&
