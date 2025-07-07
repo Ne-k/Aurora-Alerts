@@ -106,8 +106,19 @@ class NOAAForecast:
                     display_line = f"Day: {day}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f}"
                     aurora_lines.append((display_line, len(display_line)))
             
-            # Find the maximum width needed
-            max_width = max(len(line[1]) if isinstance(line[1], str) else line[1] for line in aurora_lines) + 4  # Add padding
+            # Find the maximum width needed (use a more accurate estimate)
+            max_content_width = 0
+            for line, estimated_len in aurora_lines:
+                # Better estimate for Discord timestamp display
+                clean_line = line.replace('<t:', '').replace(':R>', '')
+                # Count timestamp placeholders and estimate their rendered length
+                timestamp_count = line.count('<t:')
+                # Each timestamp roughly displays as "X time ago" (about 15-20 chars average)
+                estimated_display_length = len(clean_line) + (timestamp_count * 15)
+                max_content_width = max(max_content_width, estimated_display_length)
+            
+            # Add padding for the border characters and some extra space
+            max_width = max_content_width + 4
             
             # Create dynamic border
             top_border = "╔" + "═" * max_width + "╗"
@@ -115,9 +126,11 @@ class NOAAForecast:
             
             message += f"{top_border}\n"
             for line, _ in aurora_lines:
-                # Calculate padding needed
-                estimated_display = line.replace('<t:', '').replace(':R>', ' in X hours')  # Rough estimate
-                padding = max_width - len(estimated_display)
+                # Calculate padding more accurately
+                clean_line = line.replace('<t:', '').replace(':R>', '')
+                timestamp_count = line.count('<t:')
+                estimated_length = len(clean_line) + (timestamp_count * 15)
+                padding = max(0, max_width - estimated_length - 2)  # -2 for the border characters
                 message += f"║ {line}" + " " * padding + " ║\n"
             message += f"{bottom_border}\n"
             # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
