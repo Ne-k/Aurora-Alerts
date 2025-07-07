@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   noaa_alert:
     build: .
@@ -24,7 +22,7 @@ services:
       - .:/app
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - TEST_WEBHOOK=${TEST_WEBHOOK}
-    command: python "/app/noaa alert.py" --test
+      - TEST_WEBHOOK=${DISCORD_WEBHOOK:-}
+    entrypoint: ["python", "/app/noaa alert.py", "--test"]
     profiles:
       - test

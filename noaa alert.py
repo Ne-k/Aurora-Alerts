@@ -99,6 +99,7 @@ class NOAAForecast:
                     # Fallback to original format if timestamp parsing fails
                     message += f"║ Day: {day}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f} ║\n"
             message += "╚═══════════════════════════════════════════════════╝\n"
+            message += "```\n"  # Close the code block
             # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
             # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
 
@@ -135,7 +136,7 @@ class NOAAForecast:
                 # The check_kp_levels method will handle sending the full alert message
                 print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message sent with alert data!")
             else:
-                test_message += "```No high Kp levels detected in test data```\n"
+                test_message += "```\nNo high Kp levels detected in test data\n```\n"
                 test_message += "ℹ️ Test completed - system is operational\n"
                 # Send a simple test message without attachments
                 data = {"content": test_message}
