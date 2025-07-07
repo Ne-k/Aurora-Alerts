@@ -113,13 +113,13 @@ class NOAAForecast:
             top_border = "╔" + "═" * max_width + "╗"
             bottom_border = "╚" + "═" * max_width + "╝"
             
-            message += f"```\n{top_border}\n"
+            message += f"{top_border}\n"
             for line, _ in aurora_lines:
                 # Calculate padding needed
                 estimated_display = line.replace('<t:', '').replace(':R>', ' in X hours')  # Rough estimate
                 padding = max_width - len(estimated_display)
                 message += f"║ {line}" + " " * padding + " ║\n"
-            message += f"{bottom_border}\n```\n"
+            message += f"{bottom_border}\n"
             # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
             # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
 
