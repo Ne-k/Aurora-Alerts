@@ -12,6 +12,13 @@ class NOAAForecast:
         self.url = "https://services.swpc.noaa.gov/text/3-day-forecast.txt"
         load_dotenv()
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
+        
+        # Load configurable Kp threshold from environment (default to 6.5)
+        try:
+            self.kp_threshold = float(os.getenv('KP_THRESHOLD', '6.5'))
+        except ValueError:
+            print(f"Warning: Invalid KP_THRESHOLD value, using default 6.5")
+            self.kp_threshold = 6.5
 
     def fetch_forecast(self):
         response = requests.get(self.url)
@@ -57,7 +64,7 @@ class NOAAForecast:
 
         above_6_info = []
         for i, kp in enumerate(kp_levels):
-            if kp >= 6.5:
+            if kp >= self.kp_threshold:
                 day = days[i // 8]
                 time = times[i % 8]
                 above_6_info.append((day, time, kp))
@@ -76,7 +83,7 @@ class NOAAForecast:
             message += f"Alert detected at: <t:{current_timestamp}:F>\n"
             message += f"Time: <t:{current_timestamp}:R>\n\n"
             message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n\n"
-            message += "**Aurora kp levels above or equal to 6.5 detected on:**\n"
+            message += f"**Aurora kp levels above or equal to {self.kp_threshold} detected on:**\n"
             
             # Collect all aurora info lines first to determine max width
             aurora_lines = []
@@ -189,7 +196,7 @@ class NOAAForecast:
             
         forecast_text = self.fetch_forecast()
         if self.check_kp_levels(forecast_text):
-            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels above 6 detected!")
+            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels above {self.kp_threshold} detected!")
         else:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Kp levels are normal.")
 
