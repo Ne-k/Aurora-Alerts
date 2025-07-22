@@ -12,7 +12,6 @@ class NOAAForecast:
         self.url = "https://services.swpc.noaa.gov/text/3-day-forecast.txt"
         load_dotenv()
         self.discord_webhook = os.getenv('DISCORD_WEBHOOK')
-        
         # Load configurable Kp threshold from environment (default to 6.5)
         try:
             self.kp_threshold = float(os.getenv('KP_THRESHOLD', '6.5'))
