@@ -158,7 +158,7 @@ class NOAAForecast:
                     day_label_fmt = start_local.strftime("%b %d")
                     tz_abbr = start_local.strftime('%Z') or 'PT'
                     display_line = (
-                        f"Day: {day_label_fmt}, Time: {start_local.strftime('%H:%M')} - {end_local.strftime('%H:%M')} {tz_abbr}, Kp level: {kp:.2f}"
+                        f"Day: {day_label_fmt}, Time: {start_local.strftime('%I:%M %p')} - {end_local.strftime('%I:%M %p')} {tz_abbr}, Kp level: {kp:.2f}"
                     )
                     aurora_lines.append((display_line, len(display_line)))
                 except ValueError:
