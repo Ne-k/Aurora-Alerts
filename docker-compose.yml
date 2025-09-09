@@ -6,6 +6,7 @@ services:
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
       - KP_THRESHOLD=${KP_THRESHOLD:-6.5}
-    command: ["/app/start.sh"]
-    restart: always
+  entrypoint: ["bash", "-lc"]
+  command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
+  restart: always
   
