@@ -11,5 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Default command is provided by docker-compose (starts cron and tails logs)
-CMD ["bash", "-lc", "echo 'Use docker-compose to start services'"]
+# Normalize line endings and make startup script executable
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
+
+# Default command runs the startup script; compose can override if needed
+CMD ["/app/start.sh"]
