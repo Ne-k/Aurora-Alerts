@@ -4,9 +4,9 @@ services:
     volumes:
       - .:/app
     environment:
-      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - KP_THRESHOLD=${KP_THRESHOLD:-6.5}
-  entrypoint: ["bash", "-lc"]
-  command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
-  restart: always
+      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK}
+      KP_THRESHOLD: ${KP_THRESHOLD:-6.5}
+    entrypoint: ["bash", "-lc"]
+    command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
+    restart: always
   
