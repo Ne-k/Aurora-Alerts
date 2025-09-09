@@ -6,23 +6,12 @@ services:
     entrypoint: ["bash", "-c"]
     environment:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - TEST_WEBHOOK=${DISCORD_WEBHOOK}
+      - KP_THRESHOLD=${KP_THRESHOLD:-6.5}
     command: >
-      echo '0 8,20 * * * root python /app/noaa\ alert.py >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
+      echo '0 8 * * * root cd /app && python "noaa alert.py" >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
       chmod 0644 /etc/cron.d/noaa_alert &&
       crontab /etc/cron.d/noaa_alert &&
       touch /var/log/cron.log &&
-      cron -f
+      cron && tail -f /var/log/cron.log
     restart: always
-    
-  # Service for testing the webhook
-  noaa_alert_test:
-    build: .
-    volumes:
-      - .:/app
-    environment:
-      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - TEST_WEBHOOK=${DISCORD_WEBHOOK:-}
-    entrypoint: ["python", "/app/noaa alert.py", "--test"]
-    profiles:
-      - test
+  

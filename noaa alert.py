@@ -128,10 +128,18 @@ class NOAAForecast:
             now_local = datetime.now(local_tz)
             
             message = "🌌 **AURORA ALERT**\n\n"
-            message += f"Alert detected at: {now_local.strftime('%Y-%m-%d %I:%M %p %Z')}\n\n"
+            # Human-readable local time plus dynamic relative timestamp
+            detected_ts = int(datetime.utcnow().timestamp())
+            message += f"Alert detected at: {now_local.strftime('%a, %b %d, %Y at %I:%M %p %Z')} (\u2192 <t:{detected_ts}:R>)\n\n"
             message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n\n"
             message += f"**Aurora kp levels above or equal to {self.kp_threshold} detected on:**\n"
             
+            # Sort detections by UTC day then interval start hour
+            try:
+                above_6_info.sort(key=lambda x: (x[1], int(x[2].split('-')[0])))
+            except Exception:
+                pass
+
             # Collect all aurora info lines first to determine max width
             aurora_lines = []
             for info in above_6_info:
@@ -154,21 +162,25 @@ class NOAAForecast:
                     start_local = start_time_utc.astimezone(local_tz)
                     end_local = end_time_utc.astimezone(local_tz)
 
-                    # Use local day label and 24-hour time in PST/PDT
-                    day_label_fmt = start_local.strftime("%b %d")
+                    # Discord dynamic timestamps for start/end times, plus local short label
                     tz_abbr = start_local.strftime('%Z') or 'PT'
+                    start_ts = int(start_time_utc.timestamp())
+                    end_ts = int(end_time_utc.timestamp())
                     display_line = (
-                        f"Day: {day_label_fmt}, Time: {start_local.strftime('%I:%M %p')} - {end_local.strftime('%I:%M %p')} {tz_abbr}, Kp level: {kp:.2f}"
+                        f"Day: {day_label}, Time: <t:{start_ts}:t> - <t:{end_ts}:t> ({tz_abbr}), Kp level: {kp:.2f}"
                     )
-                    aurora_lines.append((display_line, len(display_line)))
+                    # Estimate display width considering timestamp rendering (~12 chars per <t:...>)
+                    timestamp_count = display_line.count('<t:')
+                    clean_line = display_line.replace('<t:', '').replace(':t>', '').replace(':R>', '').replace(':F>', '')
+                    estimated_len = len(clean_line) + timestamp_count * 12
+                    aurora_lines.append((display_line, estimated_len))
                 except ValueError:
                     # Fallback to original format if timestamp parsing fails
-                    day_label_fmt = day_date.strftime("%b %d")
-                    display_line = f"Day: {day_label_fmt}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f}"
+                    display_line = f"Day: {day_label}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f}"
                     aurora_lines.append((display_line, len(display_line)))
             
-            # Find the maximum width needed (plain text, no timestamp placeholders)
-            max_content_width = max((len(line) for line, _ in aurora_lines), default=0)
+            # Find the maximum width needed using estimated display lengths
+            max_content_width = max((est for _, est in aurora_lines), default=0)
             
             # Add padding for the border characters and some extra space
             max_width = max_content_width + 4
@@ -178,8 +190,8 @@ class NOAAForecast:
             bottom_border = "╚" + "═" * max_width + "╝"
             
             message += f"{top_border}\n"
-            for line, _ in aurora_lines:
-                estimated_length = len(line)
+            for line, est in aurora_lines:
+                estimated_length = est
                 padding = max(0, max_width - estimated_length - 2)  # -2 for the border characters
                 message += f"║ {line}" + " " * padding + " ║\n"
             message += f"{bottom_border}\n"

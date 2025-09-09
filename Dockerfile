@@ -1,17 +1,15 @@
 FROM python:3.11-slim
 
 # Install cron and bash
-RUN apt-get update && apt-get install -y cron bash
+RUN apt-get update && apt-get install -y --no-install-recommends cron bash \
+	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt requirements.txt
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Make sure the script file has proper line endings and is executable
-RUN chmod +x /app/run.sh
-
-# Start cron in the foreground
-CMD ["cron", "-f"]
+# Default command is provided by docker-compose (starts cron and tails logs)
+CMD ["bash", "-lc", "echo 'Use docker-compose to start services'"]
