@@ -8,10 +8,13 @@ services:
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
       - KP_THRESHOLD=${KP_THRESHOLD:-6.5}
     command: >
-      echo '0 8 * * * root cd /app && python "noaa alert.py" >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
+      echo '0 8 * * * cd /app && python -u "noaa alert.py" >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert &&
       chmod 0644 /etc/cron.d/noaa_alert &&
       crontab /etc/cron.d/noaa_alert &&
       touch /var/log/cron.log &&
-      cron && tail -f /var/log/cron.log
+      echo "[UTC $(date -u +'%F %T')] Container started. Cron scheduled for 08:00 UTC daily." >> /var/log/cron.log &&
+      echo "[UTC $(date -u +'%F %T')] Running once on startup..." >> /var/log/cron.log &&
+      cd /app && python -u "noaa alert.py" >> /var/log/cron.log 2>&1 || true &&
+      cron && tail -F /var/log/cron.log
     restart: always
   
