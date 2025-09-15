@@ -3,9 +3,14 @@ services:
     build: .
     volumes:
       - .:/app
+    env_file:
+      - .env
     environment:
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK}
-      KP_THRESHOLD: ${KP_THRESHOLD:-6.5}
+      # Default threshold lowered to 6.2 to match current alerting preference
+      KP_THRESHOLD: ${KP_THRESHOLD:-6.2}
+      # Optional: set container timezone for logs/cron; app converts times to America/Los_Angeles internally
+      TZ: ${TZ:-UTC}
     entrypoint: ["bash", "-lc"]
     command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
     restart: always

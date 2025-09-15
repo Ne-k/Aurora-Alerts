@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import json
 
 import pytz
 import requests
@@ -41,7 +42,27 @@ class NOAAForecast:
         response = requests.post(self.discord_webhook, data=data, files=files)
         response.raise_for_status()
 
-    def check_kp_levels(self, forecast_text):
+    def _state_path(self) -> str:
+        # Persisted state to avoid duplicate alerts within the same 3-day window
+        return os.path.join(os.path.dirname(__file__), 'alert_state.json')
+
+    def _load_state(self):
+        try:
+            with open(self._state_path(), 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            return {}
+
+    def _save_state(self, state: dict):
+        try:
+            with open(self._state_path(), 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"[WARN] Failed to write state file: {e}")
+
+    def check_kp_levels(self, forecast_text, debug: bool = False, record_state: bool = True):
         # Capture the entire Kp table block until the next section header
         kp_section_pattern = re.compile(
             r'NOAA Kp index breakdown[\s\S]*?(?=Rationale:|B\. NOAA|C\. NOAA|$)',
@@ -49,6 +70,8 @@ class NOAAForecast:
         )
         kp_section_match = kp_section_pattern.search(forecast_text)
         if not kp_section_match:
+            if debug:
+                print("[DEBUG] Kp section not found in forecast text")
             return False
 
         kp_section = kp_section_match.group()
@@ -74,18 +97,22 @@ class NOAAForecast:
                     days = found[:3]
                     break
             if not header_line:
+                if debug:
+                    print("[DEBUG] Could not find day header line with three dates")
                 return False
         # Safety trim
         days = [d.strip() for d in days][:3]
         if len(days) < 3:
+            if debug:
+                print(f"[DEBUG] Less than three day headers detected: {days}")
             return False
 
         # Determine issued year for accurate date construction
         issued_year_match = re.search(r':Issued:\s+(\d{4})', forecast_text)
         try:
-            issued_year = int(issued_year_match.group(1)) if issued_year_match else datetime.utcnow().year
+            issued_year = int(issued_year_match.group(1)) if issued_year_match else datetime.now(timezone.utc).year
         except Exception:
-            issued_year = datetime.utcnow().year
+            issued_year = datetime.now(timezone.utc).year
 
         # Build concrete date objects for each day column using issued year
         day_labels = days
@@ -93,21 +120,31 @@ class NOAAForecast:
             day_dates = [datetime.strptime(f"{issued_year} {d}", "%Y %b %d").date() for d in day_labels]
         except ValueError:
             # Fallback to current year if issued year parse fails unexpectedly
-            fallback_year = datetime.utcnow().year
+            fallback_year = datetime.now(timezone.utc).year
             day_dates = [datetime.strptime(f"{fallback_year} {d}", "%Y %b %d").date() for d in day_labels]
 
         # Extract each UT time row and the corresponding 3 values
         time_rows = re.findall(r'^\s*(\d{2}-\d{2})UT\s+([^\n]+)$', kp_section, flags=re.M)
         if len(time_rows) < 8:
+            if debug:
+                print(f"[DEBUG] Expected 8 UT rows, found {len(time_rows)}")
             return False
 
         above_6_info = []
+        if debug:
+            print(f"[DEBUG] Day headers: {days}")
         for interval, rest in time_rows:
-            # Capture numeric values (ignore any (Gx) annotations)
-            values = re.findall(r'(\d+(?:\.\d+)?)', rest)
+            # Remove any annotation like (G1), (G2), (G3) to avoid column misalignment
+            rest_clean = re.sub(r'\s*\(G\d+\)', '', rest)
+            # Capture numeric values per column
+            values = re.findall(r'(\d+(?:\.\d+)?)', rest_clean)
             if len(values) < 3:
                 # Not enough columns, skip the row
+                if debug:
+                    print(f"[DEBUG] Skipping row {interval}UT, parsed values: {values}")
                 continue
+            if debug:
+                print(f"[DEBUG] {interval}UT -> {values}")
             for col_idx, day_label in enumerate(day_labels):
                 try:
                     kp = float(values[col_idx])
@@ -117,6 +154,15 @@ class NOAAForecast:
                     above_6_info.append((day_label, day_dates[col_idx], f"{interval}UT", kp))
 
         if above_6_info:
+            # Create a 3-day window ID (min to max dates) including threshold for dedupe
+            window_id = f"{day_dates[0].isoformat()}_to_{day_dates[-1].isoformat()}_kp>={self.kp_threshold}"
+            state = self._load_state()
+            last_window_id = state.get('last_window_id')
+            if last_window_id == window_id and record_state:
+                if debug:
+                    print(f"[DEBUG] Already alerted for window {window_id}; skipping post.")
+                return False
+
             tonight_forecast_url = "https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png"
             tomorrow_forecast_url = "https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png"
 
@@ -129,8 +175,8 @@ class NOAAForecast:
             
             message = "🌌 **AURORA ALERT**\n\n"
             # Human-readable local time plus dynamic relative timestamp
-            detected_ts = int(datetime.utcnow().timestamp())
-            message += f"Alert detected at: {now_local.strftime('%a, %b %d, %Y at %I:%M %p %Z')} (\u2192 <t:{detected_ts}:R>)\n\n"
+            detected_ts = int(datetime.now(timezone.utc).timestamp())
+            message += f"Alert detected at: <t:{detected_ts}:F> (\u2192 <t:{detected_ts}:R>)\n\n"
             message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n\n"
             message += f"**Aurora kp levels above or equal to {self.kp_threshold} detected on:**\n"
             
@@ -140,8 +186,9 @@ class NOAAForecast:
             except Exception:
                 pass
 
-            # Collect all aurora info lines first to determine max width
+            # Collect all aurora info lines, grouped by local date
             aurora_lines = []
+            grouped: dict[str, list[tuple[str, int]]] = {}
             for info in above_6_info:
                 day_label, day_date, time, kp = info
                 start_hour = int(time.split('-')[0])
@@ -166,39 +213,41 @@ class NOAAForecast:
                     tz_abbr = start_local.strftime('%Z') or 'PT'
                     start_ts = int(start_time_utc.timestamp())
                     end_ts = int(end_time_utc.timestamp())
-                    display_line = (
-                        f"Day: {day_label}, Time: <t:{start_ts}:t> - <t:{end_ts}:t> ({tz_abbr}), Kp level: {kp:.2f}"
-                    )
+                    # Use Discord dynamic date for local date header key
+                    local_date_label = f"<t:{start_ts}:D>"
+                    # Example: <t:...:D> (PDT) • 00-03 UT → 5:00 PM – 8:00 PM • Kp 6.67
+                    ut_block_label = (time[:-2] + " UT") if time.endswith("UT") else time
+                    bullet = f"• {ut_block_label} → <t:{start_ts}:t> - <t:{end_ts}:t> • Kp {kp:.2f}"
                     # Estimate display width considering timestamp rendering (~12 chars per <t:...>)
-                    timestamp_count = display_line.count('<t:')
-                    clean_line = display_line.replace('<t:', '').replace(':t>', '').replace(':R>', '').replace(':F>', '')
+                    timestamp_count = bullet.count('<t:')
+                    clean_line = bullet.replace('<t:', '').replace(':t>', '').replace(':R>', '').replace(':F>', '')
                     estimated_len = len(clean_line) + timestamp_count * 12
-                    aurora_lines.append((display_line, estimated_len))
+                    grouped.setdefault(local_date_label, []).append((bullet, estimated_len))
                 except ValueError:
                     # Fallback to original format if timestamp parsing fails
-                    display_line = f"Day: {day_label}, Time: {start_hour:02d}:00 - {end_hour:02d}:00 UTC, Kp level: {kp:.2f}"
-                    aurora_lines.append((display_line, len(display_line)))
+                    local_date_label = f"{day_label}"
+                    bullet = f"• {start_hour:02d}:00 - {end_hour:02d}:00 UTC • Kp {kp:.2f}"
+                    grouped.setdefault(local_date_label, []).append((bullet, len(bullet)))
             
-            # Find the maximum width needed using estimated display lengths
-            max_content_width = max((est for _, est in aurora_lines), default=0)
-            
-            # Add padding for the border characters and some extra space
-            max_width = max_content_width + 4
-            
-            # Create dynamic border
-            top_border = "╔" + "═" * max_width + "╗"
-            bottom_border = "╚" + "═" * max_width + "╝"
-            
-            message += f"{top_border}\n"
-            for line, est in aurora_lines:
-                estimated_length = est
-                padding = max(0, max_width - estimated_length - 2)  # -2 for the border characters
-                message += f"║ {line}" + " " * padding + " ║\n"
-            message += f"{bottom_border}\n"
+            # Output grouped by local date with bold headers
+            for date_label in sorted(grouped.keys()):
+                message += f"**{date_label}**\n"
+                for bullet, _ in grouped[date_label]:
+                    message += f"{bullet}\n"
             # message += "\nClick on the image to see the actual forecast) [Tonight's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png)"
             # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
 
+            # Only attempt posting if webhook is configured; method will no-op otherwise
             self.post_to_discord(message, forecast_text, tonight_forecast.content, tomorrow_forecast.content)
+            if record_state:
+                # Save dedupe marker
+                state['last_window_id'] = window_id
+                state['last_alert_ts'] = int(datetime.now(timezone.utc).timestamp())
+                self._save_state(state)
+            if debug:
+                print("[DEBUG] High Kp detections:")
+                for info in above_6_info:
+                    print(f"[DEBUG] Day {info[0]} {info[2]} -> Kp {info[3]}")
             return True
         else:
             return False
@@ -207,9 +256,9 @@ class NOAAForecast:
         """
         Send a test message using the forecastExample.txt data with Discord timestamps.
         """
-        if not self.discord_webhook:
-            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: No Discord webhook URL configured!")
-            return
+        has_webhook = bool(self.discord_webhook)
+        if not has_webhook:
+            print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: No Discord webhook URL configured! Proceeding with console-only test.")
             
         try:
             # Read the example forecast data
@@ -227,17 +276,21 @@ class NOAAForecast:
             test_message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n"
             
             # Check if the example data has high Kp levels and format accordingly
-            if self.check_kp_levels(forecast_text):
+            if self.check_kp_levels(forecast_text, debug=True, record_state=False):
                 # The check_kp_levels method will handle sending the full alert message
-                print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message sent with alert data!")
+                print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message parsed with alert data!")
             else:
                 test_message += "**No high Kp levels detected in test data**\n"
                 test_message += "✅ Test completed - system is operational\n"
                 # Send a simple test message without attachments
-                data = {"content": test_message}
-                response = requests.post(self.discord_webhook, json=data)
-                response.raise_for_status()
-                print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message sent successfully!")
+                if has_webhook:
+                    data = {"content": test_message}
+                    assert self.discord_webhook is not None
+                    response = requests.post(self.discord_webhook, json=data)
+                    response.raise_for_status()
+                    print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: Test message sent successfully!")
+                else:
+                    print(test_message)
                 
         except FileNotFoundError:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: forecastExample.txt not found!")
