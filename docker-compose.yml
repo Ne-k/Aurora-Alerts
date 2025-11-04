@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   noaa_alert:
     build: .
@@ -7,11 +9,19 @@ services:
       - .env
     environment:
       DISCORD_WEBHOOK: ${DISCORD_WEBHOOK}
-      # Default threshold lowered to 6.2 to match current alerting preference
       KP_THRESHOLD: ${KP_THRESHOLD:-6.2}
-      # Optional: set container timezone for logs/cron; app converts times to America/Los_Angeles internally
       TZ: ${TZ:-UTC}
-    entrypoint: ["bash", "-lc"]
-    command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
+    entrypoint: ["bash", "-c"]
+    command: >
+      set -euo pipefail;
+      echo '0 8 * * * cd /app && python -u "noaa alert.py" >> /var/log/cron.log 2>&1' > /etc/cron.d/noaa_alert;
+      chmod 0644 /etc/cron.d/noaa_alert;
+      crontab /etc/cron.d/noaa_alert;
+      touch /var/log/cron.log;
+      echo "[UTC $(date -u +'%F %T')] Container started. Cron scheduled for 08:00 UTC daily." >> /var/log/cron.log;
+      echo "[UTC $(date -u +'%F %T')] Running once on startup..." >> /var/log/cron.log;
+      cd /app;
+      python -u "noaa alert.py" >> /var/log/cron.log 2>&1 || true;
+      cron;
+      exec tail -F /var/log/cron.log
     restart: always
-  
