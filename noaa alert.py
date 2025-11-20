@@ -2,6 +2,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 import json
+from typing import Dict, List, Tuple, Optional
 
 import pytz
 import requests
@@ -19,27 +20,150 @@ class NOAAForecast:
         except ValueError:
             print(f"Warning: Invalid KP_THRESHOLD value, using default 6.5")
             self.kp_threshold = 6.5
+        # Location and cloud cover thresholds (Portland, OR defaults)
+        try:
+            self.latitude = float(os.getenv('LATITUDE', '45.5152'))
+            self.longitude = float(os.getenv('LONGITUDE', '-122.6784'))
+        except ValueError:
+            self.latitude, self.longitude = 45.5152, -122.6784
+        self.location_name = os.getenv('LOCATION_NAME', 'Portland, OR')
+        # Cloud cover thresholds (percent)
+        self.cloud_cover_good_max = float(os.getenv('CLOUD_COVER_GOOD_MAX', '60'))  # below -> good visibility
+        self.cloud_cover_partial_max = float(os.getenv('CLOUD_COVER_PARTIAL_MAX', '80'))  # below -> partial visibility else poor
+        # GFZ API URL (placeholder base)
+        self.gfz_api_url = os.getenv('GFZ_API_URL', 'https://dataservices.gfz-potsdam.de/web/about-us/api')
+        # Optional cloud image was supported previously; currently disabled per request
+        self.cloud_image_url = os.getenv('CLOUD_IMAGE_URL', '')
 
     def fetch_forecast(self):
         response = requests.get(self.url)
         response.raise_for_status()
         return response.text
 
+    def fetch_gfz_status(self) -> str:
+        """Attempt a lightweight GET to GFZ API base or provided endpoint.
+        Returns a short status string; failures are graceful."""
+        url = self.gfz_api_url
+        try:
+            r = requests.get(url, timeout=10)
+            # Heuristic: consider status ok if 2xx and some content length
+            if 200 <= r.status_code < 300 and len(r.text) > 50:
+                return "GFZ API reachable"
+            return f"GFZ API response: HTTP {r.status_code}"
+        except Exception as e:
+            return f"GFZ API unreachable ({e.__class__.__name__})"
+
+    def fetch_cloud_cover(self) -> Dict[datetime, int]:
+        """Fetch hourly cloud cover (%) for next ~72h from Open-Meteo in UTC.
+        Returns mapping of UTC datetime -> cloud cover percent.
+        """
+        # Open-Meteo free API
+        base = "https://api.open-meteo.com/v1/forecast"
+        params = (
+            f"latitude={self.latitude}&longitude={self.longitude}&hourly=cloudcover&timezone=UTC&forecast_days=3"
+        )
+        url = f"{base}?{params}"
+        data: Dict[datetime, int] = {}
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            hours = j.get('hourly', {}).get('time', [])
+            cover = j.get('hourly', {}).get('cloudcover', [])
+            for t_str, cc in zip(hours, cover):
+                try:
+                    # Times are ISO8601; ensure UTC
+                    dt = datetime.fromisoformat(t_str.replace('Z', '+00:00')).astimezone(timezone.utc)
+                    data[dt] = int(cc)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return data
+
+    def classify_visibility(self, kp: float, cloud_avg: float) -> str:
+        """Legacy categorical visibility (kept for reference)."""
+        if kp < self.kp_threshold:
+            return "Below threshold"
+        if cloud_avg <= self.cloud_cover_good_max:
+            return "Likely"
+        if cloud_avg <= self.cloud_cover_partial_max:
+            return "Possible"
+        return "Unlikely"
+
+    def visibility_percent(self, kp: float, cloud_avg: float | None) -> int:
+        """Compute a visibility percent (0-100) based on KP strength and cloud cover.
+        Formula:
+          if kp < threshold -> 0
+          kp_factor = (kp - threshold)/(9 - threshold) clipped 0..1 (9 ~ upper extreme)
+          cloud_factor = 1 - cloud_avg/100 (or 1 if cloud_avg unavailable)
+          result = round(100 * kp_factor * cloud_factor)
+        """
+        if kp < self.kp_threshold:
+            return 0
+        kp_factor = max(0.0, min(1.0, (kp - self.kp_threshold) / (9.0 - self.kp_threshold)))
+        cloud_factor = 1.0 if cloud_avg is None else max(0.0, 1.0 - (cloud_avg / 100.0))
+        return max(0, min(100, int(round(100.0 * kp_factor * cloud_factor))))
+
+    # Remove legacy signature; cloud image disabled
+    # def fetch_cloud_image(self) -> bytes | None:
+    # Cloud image fetch temporarily disabled
+    def fetch_cloud_image(self) -> Optional[bytes]:
+        return None
+
+    def fetch_aurora_snapshot(self, lat: float, lon: float) -> Optional[dict]:
+        """Fetch additional snapshot data from auroraforecast.me using cloudscraper.
+        Returns parsed JSON or None on failure. Does not raise.
+        """
+        url = f"https://auroraforecast.me/api/seoSnapshot?lat={lat}&lon={lon}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://auroraforecast.me/portland',
+        }
+        # Try cloudscraper first; fall back to requests
+        try:
+            try:
+                import cloudscraper  # type: ignore
+                scraper = cloudscraper.create_scraper()
+                r = scraper.get(url, headers=headers, timeout=15)
+            except Exception:
+                r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
     def post_to_discord(self, message, file_content, tonight_forecast_content=None, tomorrow_forecast_content=None):
         if not self.discord_webhook:
             print(f"{datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}: No Discord webhook URL configured!")
             return
-            
-        data = {"content": message}
-        files = {
-            'file': ('forecast.txt', file_content)
-        }
-        if tonight_forecast_content:
-            files['tonight_forecast.png'] = ('tonight_forecast.png', tonight_forecast_content)
-        if tomorrow_forecast_content:
-            files['tomorrow_forecast.png'] = ('tomorrow_forecast.png', tomorrow_forecast_content)
 
-        response = requests.post(self.discord_webhook, data=data, files=files)
+        # Build attachments and files list following Discord webhook spec
+        files_list = []
+        attachments_meta = []
+        idx = 0
+        if file_content is not None:
+            files_list.append((f"files[{idx}]", ('forecast.txt', file_content)))
+            attachments_meta.append({"id": idx, "filename": 'forecast.txt'})
+            idx += 1
+        if tonight_forecast_content is not None:
+            files_list.append((f"files[{idx}]", ('tonight_forecast.png', tonight_forecast_content)))
+            attachments_meta.append({"id": idx, "filename": 'tonight_forecast.png'})
+            idx += 1
+        if tomorrow_forecast_content is not None:
+            files_list.append((f"files[{idx}]", ('tomorrow_forecast.png', tomorrow_forecast_content)))
+            attachments_meta.append({"id": idx, "filename": 'tomorrow_forecast.png'})
+            idx += 1
+
+        payload = {"content": message}
+        if attachments_meta:
+            payload["attachments"] = attachments_meta
+
+        # Use payload_json for attachments metadata and multipart files
+        response = requests.post(self.discord_webhook, data={"payload_json": json.dumps(payload)}, files=files_list if files_list else None)
         response.raise_for_status()
 
     def _state_path(self) -> str:
@@ -176,9 +300,79 @@ class NOAAForecast:
             message = "🌌 **AURORA ALERT**\n\n"
             # Human-readable local time plus dynamic relative timestamp
             detected_ts = int(datetime.now(timezone.utc).timestamp())
-            message += f"Alert detected at: <t:{detected_ts}:F> (\u2192 <t:{detected_ts}:R>)\n\n"
-            message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n\n"
-            message += f"**Aurora kp levels above or equal to {self.kp_threshold} detected on:**\n"
+            message += f"Detected: <t:{detected_ts}:F> (\u2192 <t:{detected_ts}:R>)\n"
+            message += f"Location: {self.location_name} ({self.latitude:.4f}, {self.longitude:.4f})\n"
+            message += "[Aurora Dashboard](https://www.swpc.noaa.gov/communities/aurora-dashboard-experimental)\n"
+            # Intentionally concise: omit threshold, note, and GFZ status per request
+            # Cloud cover retrieval
+            cloud_map = self.fetch_cloud_cover()
+            cloud_available = bool(cloud_map)
+            if cloud_available:
+                message += f"☁️ Cloud data: retrieved for {self.location_name}\n"
+            else:
+                message += f"☁️ Cloud data: unavailable for {self.location_name}\n"
+            # Additional snapshot from auroraforecast.me (AFM)
+            snapshot = self.fetch_aurora_snapshot(self.latitude, self.longitude)
+            if snapshot:
+                try:
+                    tonight = snapshot.get('tonight', {})
+                    cond = snapshot.get('conditions', {})
+                    ui = snapshot.get('ui', {})
+                    status_texts = (ui.get('statusTexts') or {}) if isinstance(ui, dict) else {}
+                    status_key = tonight.get('status', 'n/a')
+                    status_human = status_texts.get(status_key, str(status_key).replace('_', ' ').title())
+                    prob = tonight.get('probability', 'n/a')
+                    best = tonight.get('bestHour', 'n/a')
+                    updated_at = tonight.get('updatedAt') or snapshot.get('updatedAt')
+                    updated_line = ''
+                    if isinstance(updated_at, str):
+                        try:
+                            upd_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                            upd_ts = int(upd_dt.timestamp())
+                            updated_line = f" • updated <t:{upd_ts}:R>"
+                        except Exception:
+                            pass
+                    kp_idx = cond.get('kpIndex', 'n/a')
+                    cc = cond.get('cloudCover', 'n/a')
+                    darkness = cond.get('skyDarkness', 'n/a')
+                    message += "\n**AuroraForecast.me**\n"
+                    message += f"Tonight: {status_human} • {prob}% • Best: {best}{updated_line}\n"
+                    message += f"Conditions: KP {kp_idx} • ☁️ {cc}% • Sky: {darkness}\n"
+                    # Next hours preview (up to 3 entries)
+                    h12 = snapshot.get('h12', [])
+                    if h12:
+                        message += "Next hours:\n"
+                        for item in h12[:3]:
+                            # Prefer ISO time for Discord timestamp; fallback to provided display times
+                            iso = item.get('time')
+                            ts_part = ''
+                            if isinstance(iso, str):
+                                try:
+                                    ts_dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+                                    ts_part = f"<t:{int(ts_dt.timestamp())}:t>"
+                                except Exception:
+                                    ts_part = ''
+                            if not ts_part:
+                                ts_part = item.get('displayTime12') or item.get('displayTime24') or '?'
+                            kpv = item.get('kp', '?')
+                            pbase = item.get('probBase', '?')
+                            padj = item.get('probAdj', '?')
+                            # Round floats nicely
+                            try:
+                                kpv = f"{float(kpv):.2f}"
+                            except Exception:
+                                pass
+                            try:
+                                pbase = f"{float(pbase):.0f}"
+                            except Exception:
+                                pass
+                            try:
+                                padj = f"{float(padj):.1f}"
+                            except Exception:
+                                pass
+                            message += f"  • {ts_part}: KP {kpv} • base {pbase}% • adj +{padj}%\n"
+                except Exception:
+                    message += "AFM snapshot: parse error\n"
             
             # Sort detections by UTC day then interval start hour
             try:
@@ -217,7 +411,34 @@ class NOAAForecast:
                     local_date_label = f"<t:{start_ts}:D>"
                     # Example: <t:...:D> (PDT) • 00-03 UT → 5:00 PM – 8:00 PM • Kp 6.67
                     ut_block_label = (time[:-2] + " UT") if time.endswith("UT") else time
-                    bullet = f"• {ut_block_label} → <t:{start_ts}:t> - <t:{end_ts}:t> • Kp {kp:.2f}"
+                    # Compute average cloud cover for the interval if data available
+                    cloud_avg_display = "N/A"
+                    visibility = "Unknown"
+                    visibility_pct = 0
+                    if cloud_available:
+                        # Build list of UTC hour datetimes covered by the interval
+                        hours: List[datetime] = []
+                        temp_dt = start_time_utc
+                        while temp_dt < end_time_utc:
+                            hours.append(temp_dt)
+                            temp_dt += timedelta(hours=1)
+                        raw_values = [cloud_map.get(h) for h in hours]
+                        values = [v for v in raw_values if v is not None]
+                        if values:
+                            cloud_avg = sum(values) / float(len(values))
+                            cloud_avg_display = f"{cloud_avg:.0f}%"
+                            visibility_pct = self.visibility_percent(kp, cloud_avg)
+                            visibility = f"{visibility_pct}%"
+                        else:
+                            visibility_pct = self.visibility_percent(kp, None)
+                            visibility = f"{visibility_pct}%"
+                    else:
+                        visibility_pct = self.visibility_percent(kp, None)
+                        visibility = f"{visibility_pct}%"
+                    bullet = (
+                        f"• {ut_block_label} → <t:{start_ts}:t> - <t:{end_ts}:t> • "
+                        f"KP {kp:.2f} • ☁️ {cloud_avg_display} • 👀 {visibility}"
+                    )
                     # Estimate display width considering timestamp rendering (~12 chars per <t:...>)
                     timestamp_count = bullet.count('<t:')
                     clean_line = bullet.replace('<t:', '').replace(':t>', '').replace(':R>', '').replace(':F>', '')
@@ -238,6 +459,9 @@ class NOAAForecast:
             # message += "\n(Click on the image to see the actual forecast) [Tomorrow Night's Aurora Forecast](https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tomorrow_nights_static_viewline_forecast.png)"
 
             # Only attempt posting if webhook is configured; method will no-op otherwise
+            # Post without cloud image attachment (disabled)
+            if debug:
+                print("[DEBUG] Built message preview:\n" + message)
             self.post_to_discord(message, forecast_text, tonight_forecast.content, tomorrow_forecast.content)
             if record_state:
                 # Save dedupe marker

@@ -1,17 +1,29 @@
 services:
-  noaa_alert:
+  aurora_bot:
     build: .
-    volumes:
-      - .:/app
+    container_name: aurora-bot
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DISCORD_WEBHOOK: ${DISCORD_WEBHOOK}
-      # Default threshold lowered to 6.2 to match current alerting preference
-      KP_THRESHOLD: ${KP_THRESHOLD:-6.2}
-      # Optional: set container timezone for logs/cron; app converts times to America/Los_Angeles internally
-      TZ: ${TZ:-UTC}
-    entrypoint: ["bash", "-lc"]
-    command: ["sed -i 's/\\r$//' /app/start.sh && bash /app/start.sh"]
-    restart: always
+      # Core bot settings (override in .env as needed)
+      KP_THRESHOLD: "${KP_THRESHOLD:-6.5}"
+      LATITUDE: "${LATITUDE:-45.5152}"
+      LONGITUDE: "${LONGITUDE:--122.6784}"
+      LOCATION_NAME: "${LOCATION_NAME:-Portland, OR}"
+      TIMEZONE_NAME: "${TIMEZONE_NAME:-America/Los_Angeles}"
+      UPDATE_INTERVAL_HOURS: "${UPDATE_INTERVAL_HOURS:-2}"
+      ALERT_DELETE_AFTER_MINUTES: "${ALERT_DELETE_AFTER_MINUTES:-15}"
+      # Optional external APIs
+      GFZ_JSON_BASE_URL: "${GFZ_JSON_BASE_URL:-https://kp.gfz.de/app/json/}"
+      OPENWEATHER_API_KEY: "${OPENWEATHER_API_KEY:-}"
+      MAF_APP_USER_ID: "${MAF_APP_USER_ID:-}"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
   
