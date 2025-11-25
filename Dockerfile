@@ -1,11 +1,10 @@
-# Use Python 3.12 to avoid stdlib removals (audioop) breaking discord.py
+# Use Python 3.12 to keep discord.py voice dependencies available
 FROM python:3.12-slim
 
-# Install runtime deps (git optional for some packages), create non-root user
+# Install runtime deps (tzdata for schedule conversions)
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends bash tzdata ca-certificates \
-	&& rm -rf /var/lib/apt/lists/* \
-	&& useradd -m -u 1000 botuser
+	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -16,12 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY aurora ./aurora
 COPY README.md ./README.md
-COPY .env.example ./
+COPY forecastExample.txt ./forecastExample.txt
+COPY alert_state.json ./alert_state.json
 
-# Ensure data directory exists and set ownership
-RUN mkdir -p /app/data && chown -R botuser:botuser /app
-
-USER botuser
+# Ensure runtime data directory exists
+RUN mkdir -p /app/data
 
 # Environment defaults (can be overridden in compose)
 ENV PYTHONUNBUFFERED=1 \

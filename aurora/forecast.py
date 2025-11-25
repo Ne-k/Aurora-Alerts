@@ -58,6 +58,7 @@ class AlertBuild:
     all_forecast_lines: List[str]
     # Real-time high Kp blocks (for alert triggering, reduces false positives from forecast-only windows)
     gfz_high_blocks: List[dict]
+    swpc_high_blocks: List[dict]
     swpc_high_block: Optional[dict]
 KP_EQ_BOUNDARY = [
     (0.0, 80.0),
@@ -520,17 +521,19 @@ class ForecastEngine:
             'meta': meta,
         }
 
-    def fetch_swpc_planetary_k_latest(self) -> Optional[dict]:
+    def fetch_swpc_planetary_k_latest(self) -> Tuple[Optional[dict], List[dict]]:
         url = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json"
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
         except Exception:
-            return None
+            return None, []
         if not isinstance(data, list):
-            return None
+            return None, []
         latest = None
+        high_blocks: List[dict] = []
+        now = datetime.now(timezone.utc)
         for item in data:
             if not isinstance(item, dict):
                 continue
@@ -552,7 +555,24 @@ class ForecastEngine:
                 'estimated_kp': float(est_kp) if isinstance(est_kp, (int, float)) else None,
                 'kp_flag': str(flag) if flag is not None else None,
             }
-        return latest
+            # Collect high Kp entries within the last 12 hours
+            effective_candidates: List[float] = []
+            if isinstance(kp_index, (int, float)):
+                effective_candidates.append(float(kp_index))
+            if isinstance(est_kp, (int, float)):
+                effective_candidates.append(float(est_kp))
+            effective = max(effective_candidates) if effective_candidates else None
+            if isinstance(effective, (int, float)):
+                age_hours = (now - ts).total_seconds() / 3600.0
+                if age_hours <= 12 and effective >= self.kp_threshold:
+                    kind = 'observed' if isinstance(kp_index, (int, float)) and float(kp_index) == effective else 'estimated'
+                    high_blocks.append({
+                        'ts': int(ts.timestamp()),
+                        'kp': round(float(effective), 2),
+                        'kind': kind,
+                    })
+        high_blocks.sort(key=lambda blk: blk.get('ts', 0))
+        return latest, high_blocks
 
     def fetch_swpc_hemi_power(self) -> Optional[dict]:
         """Fetch hemispheric power (GW). Parse current SWPC tabular feed (observation + forecast + north + south).
@@ -707,7 +727,7 @@ class ForecastEngine:
         if not gfz_source_note:
             gfz_source_note = 'GFZ German Research Centre for Geosciences (CC BY 4.0)'
 
-        swpc_planetary = self.fetch_swpc_planetary_k_latest()
+        swpc_planetary, swpc_high_blocks_recent = self.fetch_swpc_planetary_k_latest()
         swpc_hemi = self.fetch_swpc_hemi_power()
         swpc_kp_latest = None
         swpc_est_kp = None
@@ -955,7 +975,7 @@ class ForecastEngine:
         if not gfz_source_note:
             gfz_source_note = 'GFZ German Research Centre for Geosciences (CC BY 4.0)'
 
-        swpc_planetary = self.fetch_swpc_planetary_k_latest()
+        swpc_planetary, swpc_high_blocks_recent = self.fetch_swpc_planetary_k_latest()
         swpc_hemi = self.fetch_swpc_hemi_power()
         swpc_planetary_line = None
         swpc_summary_lines: List[str] = []
@@ -1372,26 +1392,11 @@ class ForecastEngine:
                 line += " • " + " • ".join(extras)
             upcoming_days_lines.append(line)
         # Build real-time high Kp block structures (GFZ 3h blocks and latest SWPC planetary) for alert triggering
-        gfz_high_blocks: List[dict] = []
-        if gfz_records:
-            for rec in gfz_records[-36:]:  # recent horizon
-                if rec.value >= self.kp_threshold:
-                    gfz_high_blocks.append({
-                        'ts': int(rec.timestamp.timestamp()),
-                        'kp': round(rec.value, 2),
-                        'status': self._gfz_status_label(rec.status)
-                    })
+        gfz_high_blocks: List[dict] = []  # retained for compatibility; NOAA SWPC is now sole trigger source
         swpc_high_block: Optional[dict] = None
-        try:
-            if isinstance(swpc_effective_kp, (int, float)) and swpc_effective_kp >= self.kp_threshold and isinstance(swpc_planetary, dict):
-                ts_val = swpc_planetary.get('timestamp')
-                ts_int = int(ts_val.timestamp()) if isinstance(ts_val, datetime) else int(datetime.now(timezone.utc).timestamp())
-                swpc_high_block = {
-                    'ts': ts_int,
-                    'kp': round(float(swpc_effective_kp), 2),
-                }
-        except Exception:
-            swpc_high_block = None
+        swpc_high_blocks = swpc_high_blocks_recent or []
+        if swpc_high_blocks:
+            swpc_high_block = swpc_high_blocks[-1]
 
         return AlertBuild(
             message=message,
@@ -1418,6 +1423,7 @@ class ForecastEngine:
             aggregated_sources_line=aggregated_sources_line,
             all_forecast_lines=all_forecast_lines,
             gfz_high_blocks=gfz_high_blocks,
+            swpc_high_blocks=swpc_high_blocks,
             swpc_high_block=swpc_high_block,
         )
 

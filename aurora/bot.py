@@ -8,6 +8,31 @@ import tempfile
 import requests
 import io
 
+try:
+    import audioop  # type: ignore  # noqa: F401
+except ModuleNotFoundError:
+    import sys
+    import types
+    import warnings
+
+    audioop_stub = types.ModuleType("audioop")
+
+    class AudioopUnavailable(RuntimeError):
+        """Raised when audioop functionality is requested without support."""
+
+    def _audioop_placeholder(*args, **kwargs):
+        raise AudioopUnavailable("audioop module is unavailable; Discord voice features are disabled.")
+
+    audioop_stub.error = AudioopUnavailable  # type: ignore[attr-defined]
+    audioop_stub.__all__ = []  # type: ignore[attr-defined]
+
+    def _module_getattr(name: str):  # pragma: no cover - defensive stub
+        return _audioop_placeholder
+
+    audioop_stub.__getattr__ = _module_getattr  # type: ignore[attr-defined]
+    sys.modules["audioop"] = audioop_stub
+    warnings.warn("audioop module not available; Discord voice features disabled.", RuntimeWarning)
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -314,18 +339,19 @@ async def build_update_for_guild(guild: discord.Guild) -> tuple[str, str, str, s
     tonight_url = build.tonight_image_url if build else ''
     tomorrow_url = build.tomorrow_image_url if build else ''
     window_id = build.window_id if build else ''
-    # Build detection signature from real-time high Kp blocks only (GFZ + SWPC) to reduce false positives.
+    # Build detection signature from NOAA SWPC real-time data only to reduce false positives.
     det_sig = ''
     if build:
         tokens: List[str] = []
         try:
-            if build.gfz_high_blocks:
-                for blk in build.gfz_high_blocks:
-                    ts = blk.get('ts')
-                    kp = blk.get('kp')
+            swpc_blocks = getattr(build, 'swpc_high_blocks', None)
+            if swpc_blocks:
+                for blk in swpc_blocks:
+                    ts = blk.get('ts') if isinstance(blk, dict) else None
+                    kp = blk.get('kp') if isinstance(blk, dict) else None
                     if isinstance(ts, int) and isinstance(kp, (int, float)):
-                        tokens.append(f"GFZ:{ts}:{kp}")
-            if build.swpc_high_block:
+                        tokens.append(f"SWPC:{ts}:{kp}")
+            elif build.swpc_high_block:
                 ts = build.swpc_high_block.get('ts') if isinstance(build.swpc_high_block, dict) else None
                 kp = build.swpc_high_block.get('kp') if isinstance(build.swpc_high_block, dict) else None
                 if isinstance(ts, int) and isinstance(kp, (int, float)):
@@ -751,44 +777,64 @@ async def updater():
             combined_id = f"{window_id}|{det_sig}" if window_id else ''
             prev = cfg.get('last_window_id') or ''
             if combined_id:
+                ts_now = int(datetime.now(timezone.utc).timestamp())
                 if not prev:
-                    ts_now = int(datetime.now(timezone.utc).timestamp())
                     await set_last_window(guild.id, combined_id, ts_now)
                 elif combined_id != prev:
                     old_sig = ''
                     if '|' in prev:
                         old_sig = prev.split('|', 1)[1]
-                    old_tokens = set([t for t in old_sig.split('|') if t])
-                    new_tokens = set([t for t in det_sig.split('|') if t])
+                    old_tokens = set(t for t in old_sig.split('|') if t)
+                    new_tokens = set(t for t in det_sig.split('|') if t)
                     added = [t for t in new_tokens if t not in old_tokens]
-                    alert_lines: List[str] = []
-                    for t in added:
-                        try:
-                            if t.startswith('GFZ:'):
-                                _, ts_str, kp_str = t.split(':', 2)
-                                ts_val = int(float(ts_str))
-                                alert_lines.append(f"GFZ Kp {kp_str} at <t:{ts_val}:t>")
-                            elif t.startswith('SWPC:'):
-                                _, ts_str, kp_str = t.split(':', 2)
-                                ts_val = int(float(ts_str))
-                                alert_lines.append(f"SWPC Planetary Kp {kp_str} at <t:{ts_val}:t>")
-                        except Exception:
-                            continue
-                    if not alert_lines:
-                        alert_lines = ["New real-time high Kp activity detected."]
-                    threshold_display = engine.kp_threshold if engine else DEFAULT_KP
-                    header = f"⚠️ New high Kp window(s) ≥ {threshold_display} detected"
-                    if build and build.aggregated_sources_line:
-                        header += f"\n{build.aggregated_sources_line}"
-                    safe_lines = [str(x) for x in alert_lines if isinstance(x, str)]
-                    alert_text = header + "\n" + "\n".join(safe_lines)
-                    alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
-                    try:
-                        alert_msg = await channel.send(alert_text)
-                        asyncio.create_task(_auto_delete(alert_msg, ALERT_DELETE_AFTER_MINUTES))
-                    except Exception:
-                        logging.exception("Failed to send high-Kp alert message")
-                    ts_now = int(datetime.now(timezone.utc).timestamp())
+                    if added:
+                        alert_lines: List[str] = []
+                        swpc_block_map: dict[str, dict] = {}
+                        swpc_blocks_all = getattr(build, 'swpc_high_blocks', None) or []
+                        for blk in swpc_blocks_all:
+                            ts_val = blk.get('ts') if isinstance(blk, dict) else None
+                            kp_val = blk.get('kp') if isinstance(blk, dict) else None
+                            if isinstance(ts_val, int) and isinstance(kp_val, (int, float)):
+                                swpc_block_map[f"SWPC:{ts_val}:{kp_val}"] = blk
+                        for t in added:
+                            blk = swpc_block_map.get(t)
+                            if not blk and t.startswith('SWPC:'):
+                                # Fallback to parse token directly
+                                try:
+                                    _, ts_str, kp_str = t.split(':', 2)
+                                    blk = {'ts': int(float(ts_str)), 'kp': float(kp_str)}
+                                except Exception:
+                                    blk = None
+                            if not isinstance(blk, dict):
+                                continue
+                            ts_val = blk.get('ts') if isinstance(blk.get('ts'), int) else None
+                            kp_val = blk.get('kp') if isinstance(blk.get('kp'), (int, float)) else None
+                            if ts_val is None or kp_val is None:
+                                continue
+                            kind = blk.get('kind') if isinstance(blk.get('kind'), str) else ''
+                            kind_note = ' (est)' if kind == 'estimated' else ''
+                            alert_lines.append(f"SWPC Planetary Kp {kp_val:.2f}{kind_note} at <t:{ts_val}:t>")
+                        if alert_lines:
+                            recent_lines: List[str] = []
+                            for blk in swpc_blocks_all[-5:]:
+                                ts_val = blk.get('ts') if isinstance(blk, dict) else None
+                                kp_val = blk.get('kp') if isinstance(blk, dict) else None
+                                if isinstance(ts_val, int) and isinstance(kp_val, (int, float)):
+                                    recent_lines.append(f"• <t:{ts_val}:R>: Kp {kp_val:.2f}")
+                            threshold_display = engine.kp_threshold if engine else DEFAULT_KP
+                            header = f"⚠️ New high Kp window(s) ≥ {threshold_display} detected"
+                            if build and build.aggregated_sources_line:
+                                header += f"\n{build.aggregated_sources_line}"
+                            safe_lines = [str(x) for x in alert_lines if isinstance(x, str)]
+                            alert_text = header + "\n" + "\n".join(safe_lines)
+                            if recent_lines:
+                                alert_text += "\n\nRecent NOAA SWPC high Kp entries:\n" + "\n".join(recent_lines)
+                            alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
+                            try:
+                                alert_msg = await channel.send(alert_text)
+                                asyncio.create_task(_auto_delete(alert_msg, ALERT_DELETE_AFTER_MINUTES))
+                            except Exception:
+                                logging.exception("Failed to send high-Kp alert message")
                     await set_last_window(guild.id, combined_id, ts_now)
         except Exception as e:
             logging.exception(f"Update failed for guild {guild.id}: {e}")

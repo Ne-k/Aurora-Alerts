@@ -1,4 +1,5 @@
-data/*.db
+data/
+!data/.gitkeep
 alert_state.json
 __pycache__/
 *.pyc

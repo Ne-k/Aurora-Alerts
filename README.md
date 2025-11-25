@@ -65,6 +65,6 @@ The container uses `python -m aurora.bot` directly; legacy cron + `noaa alert.py
 
 ## Notes
 
-- Legacy one-off webhook script `noaa alert.py` has been deprecated in the Docker flow (still in repo if needed manually).
+- Legacy one-off webhook script has been removed; use `python -m aurora.bot` for all alerting flows.
 - The bot avoids hardcoding secrets; set `DISCORD_BOT_TOKEN` in `.env` or your environment.
 - Ephemeral high-Kp alerts: On each scheduled update the bot compares the new detection signature (day:UT-block:Kp) against the previous one stored in SQLite. Any newly added above-threshold windows are announced in a transient message (with consolidated sources line if available) and deleted after `ALERT_DELETE_AFTER_MINUTES`.

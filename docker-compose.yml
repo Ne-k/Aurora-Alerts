@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   aurora_bot:
     build: .
@@ -6,7 +8,10 @@ services:
     env_file:
       - .env
     environment:
-      # Core bot settings (override in .env as needed)
+      DISCORD_WEBHOOK: "${DISCORD_WEBHOOK:-}"
+      DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN:-}"
+      DISCORD_CLIENT_ID: "${DISCORD_CLIENT_ID:-}"
+      # Core bot defaults; override via .env for production tuning
       KP_THRESHOLD: "${KP_THRESHOLD:-6.5}"
       LATITUDE: "${LATITUDE:-45.5152}"
       LONGITUDE: "${LONGITUDE:--122.6784}"
@@ -18,6 +23,7 @@ services:
       GFZ_JSON_BASE_URL: "${GFZ_JSON_BASE_URL:-https://kp.gfz.de/app/json/}"
       OPENWEATHER_API_KEY: "${OPENWEATHER_API_KEY:-}"
       MAF_APP_USER_ID: "${MAF_APP_USER_ID:-}"
+      TZ: "${TZ:-UTC}"
     volumes:
       - ./data:/app/data
     healthcheck:
@@ -26,4 +32,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-  
