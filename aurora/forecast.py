@@ -1386,8 +1386,9 @@ class ForecastEngine:
                     extras.append(f"Sky {darkness}")
             except Exception:
                 pass
-            # Use Discord date stamp for human-friendly local day display
-            line = f"<t:{best.start_ts}:D>: {rng} • 👀 {best.visibility_pct}% • KP {best.kp:.2f} • ☁️ {best.cloud_avg_display}"
+            # Use Discord date stamp for human-friendly local day display (no static month/day text)
+            date_label = f"<t:{best.start_ts}:D>"
+            line = f"{date_label}: {rng} • 👀 {best.visibility_pct}% • KP {best.kp:.2f} • ☁️ {best.cloud_avg_display}"
             if extras:
                 line += " • " + " • ".join(extras)
             upcoming_days_lines.append(line)
