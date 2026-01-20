@@ -764,6 +764,28 @@ async def updater():
                     except Exception:
                         logging.exception("Guild %s: failed to edit latest bot embed", guild.id)
                         continue
+                    # Always send a short-lived notification when the embed shows above-threshold detections.
+                    try:
+                        if build and build.detections:
+                            threshold_display = engine.kp_threshold if engine else DEFAULT_KP
+                            headline = f"⚠️ Aurora conditions detected (≥ {threshold_display})"
+                            # Prefer the first recommendation line; fallback to the first detection bullet.
+                            detail = None
+                            if build.recommendation_lines:
+                                detail = build.recommendation_lines[0]
+                            elif build.detection_groups:
+                                for _, bullets in sorted(build.detection_groups.items()):
+                                    if bullets:
+                                        detail = bullets[0]
+                                        break
+                            alert_text = headline
+                            if detail:
+                                alert_text += f"\n{detail}"
+                            alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
+                            alert_msg = await channel.send(alert_text)
+                            asyncio.create_task(_auto_delete(alert_msg, ALERT_DELETE_AFTER_MINUTES))
+                    except Exception:
+                        logging.exception("Guild %s: failed to send auto-delete alert", guild.id)
                 else:
                     try:
                         await clear_channel(guild.id)
@@ -826,7 +848,22 @@ async def updater():
                             if build and build.aggregated_sources_line:
                                 header += f"\n{build.aggregated_sources_line}"
                             safe_lines = [str(x) for x in alert_lines if isinstance(x, str)]
+                            def _bust(url: str) -> str:
+                                if not url:
+                                    return url
+                                interval_min = int(os.getenv('IMAGE_CACHE_BUST_INTERVAL_MIN', '30') or '30')
+                                if interval_min < 1:
+                                    interval_min = 1
+                                token = int(ts_now // (interval_min * 60))
+                                sep = '&' if ('?' in url) else '?'
+                                return f"{url}{sep}v={token}"
+
                             alert_text = header + "\n" + "\n".join(safe_lines)
+                            # Include tonight/tomorrow images directly in the alert for quick viewing.
+                            if tonight_url:
+                                alert_text += f"\nTonight image: {_bust(tonight_url)}"
+                            if tomorrow_url and tomorrow_url != tonight_url:
+                                alert_text += f"\nTomorrow image: {_bust(tomorrow_url)}"
                             if recent_lines:
                                 alert_text += "\n\nRecent NOAA SWPC high Kp entries:\n" + "\n".join(recent_lines)
                             alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
