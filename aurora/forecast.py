@@ -1359,6 +1359,8 @@ class ForecastEngine:
             by_date.setdefault(det.day_date, []).append(det)
         for ddate in sorted(by_date.keys()):
             best = max(by_date[ddate], key=lambda x: x.visibility_pct)
+            # Use Discord timestamp for day label so Discord renders the local date dynamically
+            date_label = f"<t:{best.start_ts}:D>"
             rng = f"<t:{best.start_ts}:t>-<t:{best.end_ts}:t>"
             # Derive a simple viewline hint from latitude factor at this Kp
             try:
@@ -1386,8 +1388,6 @@ class ForecastEngine:
                     extras.append(f"Sky {darkness}")
             except Exception:
                 pass
-            # Use Discord date stamp for human-friendly local day display (no static month/day text)
-            date_label = f"<t:{best.start_ts}:D>"
             line = f"{date_label}: {rng} • 👀 {best.visibility_pct}% • KP {best.kp:.2f} • ☁️ {best.cloud_avg_display}"
             if extras:
                 line += " • " + " • ".join(extras)
