@@ -822,20 +822,42 @@ async def updater():
                             kind_note = ' (est)' if kind == 'estimated' else ''
                             alert_lines.append(f"SWPC Planetary Kp {kp_val:.2f}{kind_note} at <t:{ts_val}:t>")
                         if alert_lines:
-                            recent_lines: List[str] = []
-                            for blk in swpc_blocks_all[-5:]:
-                                ts_val = blk.get('ts') if isinstance(blk, dict) else None
-                                kp_val = blk.get('kp') if isinstance(blk, dict) else None
-                                if isinstance(ts_val, int) and isinstance(kp_val, (int, float)):
-                                    recent_lines.append(f"• <t:{ts_val}:R>: Kp {kp_val:.2f}")
                             threshold_display = engine.kp_threshold if engine else DEFAULT_KP
-                            header = f"⚠️ New high Kp window(s) ≥ {threshold_display} detected"
+                            header = f"⚠️ High Kp detected (≥ {threshold_display})"
                             if build and build.aggregated_sources_line:
                                 header += f"\n{build.aggregated_sources_line}"
-                            safe_lines = [str(x) for x in alert_lines if isinstance(x, str)]
-                            alert_text = header + "\n" + "\n".join(safe_lines)
-                            if recent_lines:
-                                alert_text += "\n\nRecent NOAA SWPC high Kp entries:\n" + "\n".join(recent_lines)
+
+                            # Pull the best viewing windows (sorted by visibility) for quick reading
+                            window_lines: List[str] = []
+                            if build and build.detections:
+                                top = sorted(build.detections, key=lambda d: d.visibility_pct, reverse=True)[:3]
+                                for det in top:
+                                    window_lines.append(
+                                        f"<t:{det.start_ts}:t>-<t:{det.end_ts}:t> • KP {det.kp:.2f} • 👀 {det.visibility_pct}%"
+                                    )
+                            else:
+                                # Fallback to the raw SWPC alert tokens if no detections are present
+                                window_lines = [str(x) for x in alert_lines if isinstance(x, str)][:3]
+
+                            alert_text = header
+                            if window_lines:
+                                alert_text += "\nBest windows:\n" + "\n".join(window_lines)
+
+                            def _bust(url: str) -> str:
+                                if not url:
+                                    return url
+                                interval_min = int(os.getenv('IMAGE_CACHE_BUST_INTERVAL_MIN', '30') or '30')
+                                if interval_min < 1:
+                                    interval_min = 1
+                                token = int(ts_now // (interval_min * 60))
+                                sep = '&' if ('?' in url) else '?'
+                                return f"{url}{sep}v={token}"
+
+                            if tonight_url:
+                                alert_text += f"\nTonight image: {_bust(tonight_url)}"
+                            if tomorrow_url and tomorrow_url != tonight_url:
+                                alert_text += f"\nTomorrow image: {_bust(tomorrow_url)}"
+
                             alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
                             try:
                                 alert_msg = await channel.send(alert_text)
