@@ -10,7 +10,7 @@ This repo now includes a Discord bot that posts and updates an aurora forecast m
   - `/aurora-set-location` – set latitude/longitude and a display name
   - `/aurora-start` – post the initial embed
   - `/aurora-show` – preview current content ephemerally
-- Background updater runs every 2 hours (configurable via `UPDATE_INTERVAL_HOURS`)
+- Background updater runs every 2 hours (configurable via `UPDATE_INTERVAL_HOURS`), retrying after `UPDATE_RETRY_MINUTES` if a cycle fails
 - When a new 3-day forecast window meets or exceeds your threshold, the bot sends an extra ephemeral alert message listing only the newly added high-Kp window(s); this auto-deletes after a configurable delay
 - Uses SQLite for persistent per-guild configuration (`data/aurora.db`)
 
@@ -62,6 +62,34 @@ The container uses `python -m aurora.bot` directly; legacy cron + `noaa alert.py
 - `/aurora-show` – shows a preview ephemerally to you
 - `/aurora-next-30` – quick-look probability for the next 30 minutes
 - `/aurora-gfz-hourly` – latest GFZ Kp values plus NOAA outlook in a dedicated embed
+- `/aurora-refresh` – rebuild the tracked embed now
+- `/aurora-stop` – stop updates in this server
+- `/aurora-health` – per-source status of every upstream feed
+
+## Reliability
+
+All outbound HTTP goes through one pooled session in `aurora/net.py` with a hard cap
+on sockets per host, bounded retries, and a short TTL cache. Before this, every fetch
+built its own connection pool and the per-call cloudscraper session was never closed,
+so the container leaked file descriptors until every source failed with
+`OSError: [Errno 24] Too many open files` and the embed stopped updating.
+
+Behaviour that follows from that:
+
+- The health sweep runs once at startup, not on every gateway reconnect.
+- A failed cycle keeps the embed alive: it shows the last good data with a visible
+  "live data unavailable" banner instead of going silently stale.
+- If the tracked message is deleted, the bot reposts on the next cycle rather than
+  clearing the channel configuration.
+- The updater writes `data/heartbeat`; `python -m aurora.healthcheck` fails when that
+  file goes stale, which surfaces as an unhealthy container in `docker ps`. Plain
+  Docker does not restart on health failure, so treat it as a signal, not a fix.
+
+## Tests
+
+```
+python -m unittest discover -s tests -p "test_*.py"
+```
 
 ## Notes
 

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   aurora_bot:
     build: .
@@ -19,6 +17,12 @@ services:
       TIMEZONE_NAME: "${TIMEZONE_NAME:-America/Los_Angeles}"
       UPDATE_INTERVAL_HOURS: "${UPDATE_INTERVAL_HOURS:-2}"
       ALERT_DELETE_AFTER_MINUTES: "${ALERT_DELETE_AFTER_MINUTES:-15}"
+      HEALTH_REFRESH_MINUTES: "${HEALTH_REFRESH_MINUTES:-60}"
+      UPDATE_RETRY_MINUTES: "${UPDATE_RETRY_MINUTES:-15}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Outbound HTTP limits
+      HTTP_POOL_SIZE: "${HTTP_POOL_SIZE:-8}"
+      HTTP_TIMEOUT_SECONDS: "${HTTP_TIMEOUT_SECONDS:-20}"
       # Optional external APIs
       GFZ_JSON_BASE_URL: "${GFZ_JSON_BASE_URL:-https://kp.gfz.de/app/json/}"
       OPENWEATHER_API_KEY: "${OPENWEATHER_API_KEY:-}"
@@ -26,9 +30,20 @@ services:
       TZ: "${TZ:-UTC}"
     volumes:
       - ./data:/app/data
+    # Headroom over the pooled socket count, so a burst cannot wedge the process
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    # Keep log growth bounded on small hosts
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0)"]
+      test: ["CMD", "python", "-m", "aurora.healthcheck"]
       interval: 5m
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 3m

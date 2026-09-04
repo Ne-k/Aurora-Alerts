@@ -16,15 +16,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY aurora ./aurora
 COPY README.md ./README.md
 COPY forecastExample.txt ./forecastExample.txt
-COPY alert_state.json ./alert_state.json
 
 # Ensure runtime data directory exists
 RUN mkdir -p /app/data
 
 # Environment defaults (can be overridden in compose)
 ENV PYTHONUNBUFFERED=1 \
+	PYTHONDONTWRITEBYTECODE=1 \
 	UPDATE_INTERVAL_HOURS=2 \
 	ALERT_DELETE_AFTER_MINUTES=15
+
+# Restart the container if the updater stops writing its heartbeat
+HEALTHCHECK --interval=5m --timeout=10s --start-period=3m --retries=3 \
+	CMD python -m aurora.healthcheck || exit 1
 
 # Run the Discord bot directly
 CMD ["python", "-m", "aurora.bot"]

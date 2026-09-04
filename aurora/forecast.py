@@ -8,8 +8,20 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 import pytz
-import requests
 from dotenv import load_dotenv
+
+from . import net
+
+load_dotenv()
+
+TTL_NOAA_FORECAST = 600      # 3-day text product refreshes ~every 30 min
+TTL_PLANETARY_K = 60         # 1-minute planetary K feed
+TTL_HEMI_POWER = 300
+TTL_OVATION = 300
+TTL_GFZ = 300                # slow endpoint (~7s), worth caching hard
+TTL_CLOUDS = 1800
+TTL_MAF = 600
+TTL_SNAPSHOT = 600
 
 
 @dataclass
@@ -60,6 +72,14 @@ class AlertBuild:
     gfz_high_blocks: List[dict]
     swpc_high_blocks: List[dict]
     swpc_high_block: Optional[dict]
+    # Highest Kp anywhere in the 3-day NOAA table, used to colour the embed
+    max_forecast_kp: Optional[float] = None
+    # Compact "right now" facts for the embed header
+    now_lines: Optional[List[str]] = None
+    # Per-day forecast columns: [{'ts': midnight_utc, 'lines': [...]}, ...]
+    forecast_columns: Optional[List[Dict[str, object]]] = None
+    # Which upstream sources answered on this build
+    sources_ok: Optional[Dict[str, bool]] = None
 KP_EQ_BOUNDARY = [
     (0.0, 80.0),
     (1.0, 75.0),
@@ -88,7 +108,6 @@ class ForecastEngine:
                  cloud_cover_good_max: float = 60,
                  cloud_cover_partial_max: float = 80,
                  gfz_api_url: str = 'https://kp.gfz.de/app/json/'):
-        load_dotenv()
         self.url = "https://services.swpc.noaa.gov/text/3-day-forecast.txt"
         self.kp_threshold = kp_threshold
         self.latitude = latitude
@@ -105,9 +124,10 @@ class ForecastEngine:
         self.gfz_api_url = self.gfz_json_base
 
     def fetch_forecast(self) -> str:
-        r = requests.get(self.url, timeout=20)
-        r.raise_for_status()
-        return r.text
+        text = net.cached_text('noaa:3day', self.url, TTL_NOAA_FORECAST, label='noaa_forecast')
+        if not text:
+            raise RuntimeError("NOAA 3-day forecast unavailable")
+        return text
 
     def fetch_cloud_cover(self) -> Dict[datetime, int]:
         base = "https://api.open-meteo.com/v1/forecast"
@@ -116,10 +136,9 @@ class ForecastEngine:
         )
         url = f"{base}?{params}"
         data: Dict[datetime, int] = {}
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            j = r.json()
+        cache_key = f"clouds:{round(self.latitude, 3)}:{round(self.longitude, 3)}"
+        j = net.cached_json(cache_key, url, TTL_CLOUDS, label='cloud_cover')
+        if isinstance(j, dict):
             hours = j.get('hourly', {}).get('time', [])
             cover = j.get('hourly', {}).get('cloudcover', [])
             for t_str, cc in zip(hours, cover):
@@ -128,8 +147,6 @@ class ForecastEngine:
                     data[dt] = int(cc)
                 except Exception:
                     continue
-        except Exception:
-            pass
         # Fallback to OpenWeather if no data and API key is present
         if not data:
             try:
@@ -217,7 +234,7 @@ class ForecastEngine:
                 f"https://api.openweathermap.org/data/3.0/onecall?lat={self.latitude}&lon={self.longitude}"
                 f"&exclude=minutely,daily,alerts,current&appid={api_key}&units=metric"
             )
-            r = requests.get(url, timeout=15)
+            r = net.get(url, timeout=15)
             if r.status_code == 200:
                 j = r.json()
                 for h in j.get('hourly', []) or []:
@@ -248,7 +265,7 @@ class ForecastEngine:
                 f"https://api.openweathermap.org/data/2.5/forecast?lat={self.latitude}&lon={self.longitude}"
                 f"&appid={api_key}&units=metric"
             )
-            r = requests.get(url, timeout=15)
+            r = net.get(url, timeout=15)
             if r.status_code == 200:
                 j = r.json()
                 for it in j.get('list', []) or []:
@@ -277,15 +294,25 @@ class ForecastEngine:
         return out
 
     def fetch_ovation_probability(self, lat: float, lon: float) -> Optional[int]:
-        """Fetch NOAA Ovation aurora latest JSON and estimate the current
-        probability (%) at the given lat/lon using nearest-neighbor on the grid.
-        Returns an integer 0..100 or None if unavailable.
+        """Nearest-neighbour Ovation probability (%) at lat/lon, or None.
+
+        The upstream payload is ~900 KB, so both the download and the grid walk
+        are memoized per location.
         """
+        key = f"ovation:{round(lat, 2)}:{round(lon, 2)}"
+        return net.cached(
+            key,
+            TTL_OVATION,
+            lambda: self._ovation_probability_uncached(lat, lon),
+            label='ovation',
+        )
+
+    def _ovation_probability_uncached(self, lat: float, lon: float) -> Optional[int]:
         url = "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json"
         try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            j = r.json()
+            j = net.cached_json('ovation:grid', url, TTL_OVATION, label='ovation_grid')
+            if j is None:
+                return None
             candidates: List[Tuple[float, float, float]] = []  # (lat, lon, prob)
             # Known structures seen in variants of this dataset
             # 1) FeatureCollection with features[{geometry:{coordinates:[lon,lat]}, properties:{probability:..}}]
@@ -369,9 +396,9 @@ class ForecastEngine:
             'longitude': str(lon),
             'timezone': tz_name,
         }
-        try:
-            # Explicitly disable proxies (disregard any proxy settings)
-            r = requests.post(url, headers=headers, data=data, timeout=20, proxies={})
+
+        def _produce() -> Optional[dict]:
+            r = net.post(url, headers=headers, data=data, timeout=20, proxies={})
             r.raise_for_status()
             # First try direct JSON
             try:
@@ -384,15 +411,16 @@ class ForecastEngine:
             start = txt.find('{')
             end = txt.rfind('}')
             if start != -1 and end != -1 and end > start:
-                snippet = txt[start:end+1]
+                snippet = txt[start:end + 1]
                 try:
                     return json.loads(snippet)
                 except Exception:
                     # Last resort: return raw
                     return {'raw': txt}
             return {'raw': txt}
-        except Exception:
-            return None
+
+        key = f"maf:{round(lat, 3)}:{round(lon, 3)}:{tz_name}"
+        return net.cached(key, TTL_MAF, _produce, label='maf')
 
     def fetch_gfz_series(self, start: datetime, end: datetime, index: str = 'Kp', status: Optional[str] = None) -> Tuple[List[GFZRecord], Optional[dict]]:
         """Fetch GFZ geomagnetic index data (default: Kp) between start and end timestamps.
@@ -409,11 +437,19 @@ class ForecastEngine:
         headers = {
             'User-Agent': os.getenv('GFZ_USER_AGENT', 'AuroraAlertsBot/1.0 (+https://github.com/Ne-k/Aurora-Alerts)')
         }
-        try:
-            r = requests.get(base_url, params=params, timeout=20, headers=headers)
+
+        def _produce():
+            r = net.get(base_url, params=params, timeout=20, headers=headers)
             r.raise_for_status()
-            payload = r.json()
-        except Exception:
+            return r.json()
+
+        # Round the window to the cache TTL so repeated calls within a cycle
+        # reuse one response instead of hitting a ~7 s endpoint each time.
+        bucket = int(datetime.now(timezone.utc).timestamp() // TTL_GFZ)
+        span_hours = max(1, int(round((end - start).total_seconds() / 3600.0)))
+        key = f"gfz:{index}:{status or '-'}:{span_hours}h:{bucket}"
+        payload = net.cached(key, TTL_GFZ, _produce, label='gfz')
+        if payload is None:
             return [], None
         if not isinstance(payload, dict):
             return [], None
@@ -523,12 +559,7 @@ class ForecastEngine:
 
     def fetch_swpc_planetary_k_latest(self) -> Tuple[Optional[dict], List[dict]]:
         url = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json"
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None, []
+        data = net.cached_json('swpc:planetary_k', url, TTL_PLANETARY_K, label='swpc_planetary')
         if not isinstance(data, list):
             return None, []
         latest = None
@@ -583,10 +614,11 @@ class ForecastEngine:
         """
         text_url = "https://services.swpc.noaa.gov/text/aurora-nowcast-hemi-power.txt"
         latest: Optional[dict] = None
+        body = net.cached_text('swpc:hemi', text_url, TTL_HEMI_POWER, label='swpc_hemi')
+        if not body:
+            return None
         try:
-            r = requests.get(text_url, timeout=15)
-            r.raise_for_status()
-            for raw_line in r.text.splitlines():
+            for raw_line in body.splitlines():
                 line = raw_line.strip()
                 if not line or line.startswith('#'):
                     continue
@@ -689,18 +721,15 @@ class ForecastEngine:
             'Accept': '*/*',
             'Referer': 'https://auroraforecast.me/portland',
         }
-        try:
-            try:
-                import cloudscraper  # type: ignore
-                scraper = cloudscraper.create_scraper()
-                r = scraper.get(url, headers=headers, timeout=15)
-            except Exception:
-                r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return None
+
+        def _produce() -> Optional[dict]:
+            r = net.scraper().get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                return None
+            return r.json()
+
+        key = f"afm:{round(lat, 3)}:{round(lon, 3)}"
+        return net.cached(key, TTL_SNAPSHOT, _produce, label='afm_snapshot')
 
     def short_term_visibility_series(self, minutes: int = 30, step: int = 5) -> dict:
         """Compute short-term viewing probability for the next `minutes` in `step`-minute increments."""
@@ -888,6 +917,17 @@ class ForecastEngine:
                 midnight_ts.append(int(dt_mid.timestamp()))
             header = f"Dates: <t:{midnight_ts[0]}:D> | <t:{midnight_ts[1]}:D> | <t:{midnight_ts[2]}:D>"
             all_forecast_lines.append(header)
+        # One column per day, rendered as side-by-side inline embed fields.
+        # Field names are plain text in Discord, so carry a rendered label too.
+        forecast_columns: List[Dict[str, object]] = [
+            {
+                'ts': ts,
+                'label': day_dates[idx].strftime('%a, %b %d').replace(' 0', ' '),
+                'lines': [],
+            }
+            for idx, ts in enumerate(midnight_ts)
+        ] if days else []
+        max_forecast_kp: Optional[float] = None
         for interval, rest in time_rows:
             rest_clean_full = re.sub(r'\s*\(G\d+\)', '', rest)
             vals_full = re.findall(r'(\d+(?:\.\d+)?)', rest_clean_full)
@@ -904,14 +944,14 @@ class ForecastEngine:
                 raw = vals_full[i]
                 try:
                     v = float(raw)
+                    if max_forecast_kp is None or v > max_forecast_kp:
+                        max_forecast_kp = v
                     val_disp = f"{v:.2f}"
                     if v >= self.kp_threshold:
                         val_disp = f"**{val_disp}**"
                     formatted_vals.append(val_disp)
                 except Exception:
                     formatted_vals.append(raw)
-            # Compose line with localized time for each day's block start + value
-            # Example: 00-03UT: <t:...:t> 8.00 | <t:...:t> 4.67 | <t:...:t> 2.33
             line = (
                 f"{interval}UT: "
                 f"{ts_labels[0]} {formatted_vals[0]} | "
@@ -919,6 +959,10 @@ class ForecastEngine:
                 f"{ts_labels[2]} {formatted_vals[2]}"
             )
             all_forecast_lines.append(line)
+            for col_idx in range(min(3, len(forecast_columns))):
+                lines_ref = forecast_columns[col_idx]['lines']
+                if isinstance(lines_ref, list):
+                    lines_ref.append(f"{ts_labels[col_idx]} · {formatted_vals[col_idx]}")
 
         above_info: List[Tuple[str, date, str, float]] = []
         for interval, rest in time_rows:
@@ -1069,7 +1113,6 @@ class ForecastEngine:
 
         detections: List[Detection] = []  # retained for embed display (forecast windows)
         utc = pytz.utc
-        local_tz = pytz.timezone('America/Los_Angeles')
         for day_label, day_date, time_block, kp in above_info:
             start_hour = int(time_block.split('-')[0])
             end_hour = int(time_block.split('-')[1][:2])
@@ -1250,6 +1293,52 @@ class ForecastEngine:
             agg_parts.append(f"MAF {maf_prob}%")
         aggregated_sources_line = "Sources: " + " • ".join(agg_parts) if agg_parts else None
 
+        # Compact "right now" facts. These used to be fetched and then thrown
+        # away, which left the embed with nothing but a below-threshold table.
+        now_lines: List[str] = []
+        if isinstance(swpc_effective_kp, (int, float)):
+            kind = 'estimated' if swpc_kp_latest is None else 'observed'
+            now_lines.append(f"**Kp {float(swpc_effective_kp):.2f}** ({kind}) · {self.kp_activity_label(float(swpc_effective_kp))}")
+        elif isinstance(gfz_latest_value, (int, float)):
+            now_lines.append(f"**Kp {float(gfz_latest_value):.2f}** (GFZ) · {self.kp_activity_label(float(gfz_latest_value))}")
+        detail_bits: List[str] = []
+        if isinstance(ovation_prob, int):
+            detail_bits.append(f"Ovation {ovation_prob}%")
+        if isinstance(hemi_total, (int, float)):
+            detail_bits.append(f"Hemispheric power {float(hemi_total):.0f} GW")
+        if isinstance(gfz_latest_value, (int, float)) and isinstance(swpc_effective_kp, (int, float)):
+            detail_bits.append(f"GFZ {float(gfz_latest_value):.2f}")
+        cloud_now_val: Optional[int] = None
+        if snapshot and isinstance(snapshot, dict):
+            try:
+                cc_val = (snapshot.get('conditions') or {}).get('cloudCover')
+                if isinstance(cc_val, (int, float)):
+                    cloud_now_val = int(round(float(cc_val)))
+            except Exception:
+                cloud_now_val = None
+        if cloud_now_val is None and cloud_map:
+            hour_dt = now_utc.replace(minute=0, second=0, microsecond=0)
+            candidate = cloud_map.get(hour_dt) or cloud_map.get(hour_dt - timedelta(hours=1))
+            if isinstance(candidate, (int, float)):
+                cloud_now_val = int(round(float(candidate)))
+        if isinstance(cloud_now_val, int):
+            detail_bits.append(f"☁️ {cloud_now_val}%")
+        if isinstance(sky_darkness, str) and sky_darkness:
+            detail_bits.append(f"Sky {sky_darkness}")
+        if detail_bits:
+            now_lines.append(" · ".join(detail_bits))
+
+        sources_ok = {
+            'noaa_forecast': True,
+            'gfz': bool(gfz_records),
+            'swpc_planetary': isinstance(swpc_planetary, dict),
+            'swpc_hemi': isinstance(swpc_hemi, dict),
+            'ovation': isinstance(ovation_prob, int),
+            'cloud_cover': bool(cloud_map),
+            'maf': isinstance(maf, dict) and bool(maf),
+            'afm_snapshot': isinstance(snapshot, dict) and bool(snapshot),
+        }
+
         # Build flat message (legacy) and structured groups (now suppressing separate GFZ/NOAA blocks if aggregated line present)
         message = self._render_message(
             detections,
@@ -1426,7 +1515,41 @@ class ForecastEngine:
             gfz_high_blocks=gfz_high_blocks,
             swpc_high_blocks=swpc_high_blocks,
             swpc_high_block=swpc_high_block,
+            max_forecast_kp=max_forecast_kp,
+            now_lines=now_lines,
+            forecast_columns=forecast_columns,
+            sources_ok=sources_ok,
         )
+
+    @staticmethod
+    def kp_activity_label(kp: float) -> str:
+        if kp >= 8:
+            return "G4 severe storm"
+        if kp >= 7:
+            return "G3 strong storm"
+        if kp >= 6:
+            return "G2 moderate storm"
+        if kp >= 5:
+            return "G1 minor storm"
+        if kp >= 4:
+            return "active"
+        if kp >= 3:
+            return "unsettled"
+        return "quiet"
+
+    @staticmethod
+    def kp_color(kp: Optional[float]) -> int:
+        if not isinstance(kp, (int, float)):
+            return 0x5865F2
+        if kp >= 7:
+            return 0xE03131  # red
+        if kp >= 6:
+            return 0xF76707  # orange
+        if kp >= 5:
+            return 0xF59F00  # amber
+        if kp >= 4:
+            return 0x74B816  # green
+        return 0x1C7ED6  # calm blue
 
     def _tonight_url(self) -> str:
         return "https://services.swpc.noaa.gov/experimental/images/aurora_dashboard/tonights_static_viewline_forecast.png"
