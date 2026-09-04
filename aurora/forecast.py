@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import pytz
 from dotenv import load_dotenv
 
+from . import astro
 from . import net
 
 load_dotenv()
@@ -22,6 +23,13 @@ TTL_GFZ = 300                # slow endpoint (~7s), worth caching hard
 TTL_CLOUDS = 1800
 TTL_MAF = 600
 TTL_SNAPSHOT = 600
+TTL_SOLAR_WIND = 120       # propagated L1 data, 1-minute cadence
+TTL_ALERTS = 300
+
+# Bz at or below this, in nT, is the classic "go outside" signal.
+BZ_SOUTH_NT = float(os.getenv('BZ_SOUTH_NT', '-5') or -5)
+# Codes SWPC uses for geomagnetic products: K alerts, K warnings, storm watches.
+GEOMAGNETIC_ALERT_PREFIXES = ('ALTK', 'WARK', 'WATA')
 
 
 @dataclass
@@ -80,6 +88,17 @@ class AlertBuild:
     forecast_columns: Optional[List[Dict[str, object]]] = None
     # Which upstream sources answered on this build
     sources_ok: Optional[Dict[str, bool]] = None
+    # Spans where high Kp, darkness and clear sky actually coincide
+    viewable_windows: Optional[List[dict]] = None
+    viewable_lines: Optional[List[str]] = None
+    no_viewable_reason: Optional[str] = None
+    # Real-time solar wind at Earth
+    solar_wind: Optional[dict] = None
+    solar_wind_line: Optional[str] = None
+    # Official SWPC geomagnetic watches and warnings
+    alerts: Optional[List[dict]] = None
+    alert_lines: Optional[List[str]] = None
+    sky_now: Optional[Dict[str, object]] = None
 KP_EQ_BOUNDARY = [
     (0.0, 80.0),
     (1.0, 75.0),
@@ -129,24 +148,45 @@ class ForecastEngine:
             raise RuntimeError("NOAA 3-day forecast unavailable")
         return text
 
-    def fetch_cloud_cover(self) -> Dict[datetime, int]:
+    def fetch_cloud_detail(self) -> Dict[datetime, Dict[str, int]]:
+        """Hourly cloud cover split by layer. Low cloud is what actually blocks."""
         base = "https://api.open-meteo.com/v1/forecast"
         params = (
-            f"latitude={self.latitude}&longitude={self.longitude}&hourly=cloudcover&timezone=UTC&forecast_days=3"
+            f"latitude={self.latitude}&longitude={self.longitude}"
+            "&hourly=cloudcover,cloudcover_low,cloudcover_mid,cloudcover_high"
+            "&timezone=UTC&forecast_days=3"
         )
         url = f"{base}?{params}"
-        data: Dict[datetime, int] = {}
         cache_key = f"clouds:{round(self.latitude, 3)}:{round(self.longitude, 3)}"
         j = net.cached_json(cache_key, url, TTL_CLOUDS, label='cloud_cover')
-        if isinstance(j, dict):
-            hours = j.get('hourly', {}).get('time', [])
-            cover = j.get('hourly', {}).get('cloudcover', [])
-            for t_str, cc in zip(hours, cover):
-                try:
-                    dt = datetime.fromisoformat(t_str.replace('Z', '+00:00')).astimezone(timezone.utc)
-                    data[dt] = int(cc)
-                except Exception:
-                    continue
+        out: Dict[datetime, Dict[str, int]] = {}
+        if not isinstance(j, dict):
+            return out
+        hourly = j.get('hourly', {}) or {}
+        times = hourly.get('time', []) or []
+        series = {
+            'total': hourly.get('cloudcover', []) or [],
+            'low': hourly.get('cloudcover_low', []) or [],
+            'mid': hourly.get('cloudcover_mid', []) or [],
+            'high': hourly.get('cloudcover_high', []) or [],
+        }
+        for i, t_str in enumerate(times):
+            try:
+                dt = datetime.fromisoformat(str(t_str).replace('Z', '+00:00')).astimezone(timezone.utc)
+            except Exception:
+                continue
+            entry: Dict[str, int] = {}
+            for key, values in series.items():
+                if i < len(values) and isinstance(values[i], (int, float)):
+                    entry[key] = int(values[i])
+            if 'total' in entry:
+                out[dt] = entry
+        return out
+
+    def fetch_cloud_cover(self) -> Dict[datetime, int]:
+        data: Dict[datetime, int] = {
+            dt: entry['total'] for dt, entry in self.fetch_cloud_detail().items() if 'total' in entry
+        }
         # Fallback to OpenWeather if no data and API key is present
         if not data:
             try:
@@ -513,7 +553,8 @@ class ForecastEngine:
         else:
             if kp_clamped >= KP_EQ_BOUNDARY[-1][0]:
                 boundary = KP_EQ_BOUNDARY[-1][1]
-        lat_abs = abs(self.latitude)
+        # The boundary table is geomagnetic, so the site latitude must be too.
+        lat_abs = abs(astro.geomagnetic_latitude(self.latitude, self.longitude))
         diff = boundary - lat_abs
         if diff <= 0:
             return 1.0
@@ -605,6 +646,189 @@ class ForecastEngine:
         high_blocks.sort(key=lambda blk: blk.get('ts', 0))
         return latest, high_blocks
 
+    def fetch_solar_wind(self) -> Optional[dict]:
+        """Real-time solar wind at Earth: Bz, Bt, speed, density.
+
+        Kp is a three-hour average published after the fact. Southward Bz is the
+        actual driver and arrives with real lead time, so this is the only feed
+        that says anything about the next hour rather than the last one.
+        """
+        url = "https://services.swpc.noaa.gov/products/geospace/propagated-solar-wind-1-hour.json"
+        rows = net.cached_json('swpc:solar_wind', url, TTL_SOLAR_WIND, label='solar_wind')
+        if not isinstance(rows, list) or len(rows) < 2:
+            return None
+        header = rows[0]
+        if not isinstance(header, list):
+            return None
+        try:
+            idx = {name: header.index(name) for name in ('time_tag', 'speed', 'density', 'bz', 'bt')}
+        except ValueError:
+            return None
+
+        samples: List[dict] = []
+        for row in rows[1:]:
+            if not isinstance(row, list) or len(row) <= max(idx.values()):
+                continue
+            try:
+                ts = datetime.fromisoformat(str(row[idx['time_tag']]).replace('Z', '+00:00'))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            def _num(key: str) -> Optional[float]:
+                val = row[idx[key]]
+                return float(val) if isinstance(val, (int, float)) else None
+            bz = _num('bz')
+            if bz is None:
+                continue
+            samples.append({
+                'ts': ts,
+                'bz': bz,
+                'bt': _num('bt'),
+                'speed': _num('speed'),
+                'density': _num('density'),
+            })
+        if not samples:
+            return None
+        samples.sort(key=lambda s: s['ts'])
+        latest = samples[-1]
+
+        recent = [s for s in samples if (latest['ts'] - s['ts']).total_seconds() <= 3600]
+        bz_values = [s['bz'] for s in recent]
+        south_minutes = sum(1 for s in recent if s['bz'] <= BZ_SOUTH_NT)
+        return {
+            'ts': int(latest['ts'].timestamp()),
+            'bz': latest['bz'],
+            'bt': latest['bt'],
+            'speed': latest['speed'],
+            'density': latest['density'],
+            'bz_min_1h': min(bz_values) if bz_values else None,
+            'bz_mean_1h': sum(bz_values) / len(bz_values) if bz_values else None,
+            'south_minutes_1h': south_minutes,
+            'samples': len(recent),
+        }
+
+    @staticmethod
+    def solar_wind_drive(wind: Optional[dict]) -> Optional[float]:
+        """Coupling strength 0..1 from southward Bz and wind speed."""
+        if not isinstance(wind, dict):
+            return None
+        bz = wind.get('bz')
+        speed = wind.get('speed')
+        if not isinstance(bz, (int, float)):
+            return None
+        southward = max(0.0, -float(bz))
+        speed_term = (float(speed) / 500.0) if isinstance(speed, (int, float)) else 1.0
+        drive = (southward / 10.0) * max(0.4, min(2.0, speed_term))
+        return max(0.0, min(1.0, drive))
+
+    @staticmethod
+    def solar_wind_line(wind: Optional[dict]) -> Optional[str]:
+        if not isinstance(wind, dict):
+            return None
+        bz = wind.get('bz')
+        if not isinstance(bz, (int, float)):
+            return None
+        direction = 'south' if bz < 0 else 'north'
+        parts = [f"Bz {float(bz):+.1f} nT {direction}"]
+        speed = wind.get('speed')
+        if isinstance(speed, (int, float)):
+            parts.append(f"{float(speed):.0f} km/s")
+        density = wind.get('density')
+        if isinstance(density, (int, float)):
+            parts.append(f"{float(density):.1f} p/cm³")
+        drive = ForecastEngine.solar_wind_drive(wind)
+        if isinstance(drive, float):
+            if drive >= 0.6:
+                parts.append("**strong coupling**")
+            elif drive >= 0.3:
+                parts.append("moderate coupling")
+            else:
+                parts.append("weak coupling")
+        return " · ".join(parts)
+
+    def fetch_space_weather_alerts(self) -> List[dict]:
+        """Official SWPC geomagnetic watches, warnings and alerts."""
+        url = "https://services.swpc.noaa.gov/products/alerts.json"
+        raw = net.cached_json('swpc:alerts', url, TTL_ALERTS, label='swpc_alerts')
+        if not isinstance(raw, list):
+            return []
+
+        def _parse_stamp(text: str) -> Optional[datetime]:
+            try:
+                return datetime.strptime(text.strip(), "%Y %b %d %H%M UTC").replace(tzinfo=timezone.utc)
+            except Exception:
+                return None
+
+        now = datetime.now(timezone.utc)
+        out: List[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get('message') or '').replace('\r\n', '\n')
+            code_match = re.search(r'Space Weather Message Code:\s*(\w+)', message)
+            code = code_match.group(1) if code_match else ''
+            if not code.startswith(GEOMAGNETIC_ALERT_PREFIXES):
+                continue
+            try:
+                issued = datetime.fromisoformat(str(item.get('issue_datetime'))).replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if (now - issued).total_seconds() > 48 * 3600:
+                continue
+            headline_match = re.search(
+                r'^((?:EXTENDED |CONTINUED |CANCEL )?(?:ALERT|WARNING|WATCH|SUMMARY)):\s*(.+)$',
+                message,
+                flags=re.M,
+            )
+            if not headline_match:
+                continue
+            kind = headline_match.group(1).strip()
+            headline = headline_match.group(2).strip()
+            valid_to = None
+            for pattern in (r'Now Valid Until:\s*(.+)', r'Valid To:\s*(.+)'):
+                found = re.search(pattern, message)
+                if found:
+                    valid_to = _parse_stamp(found.group(1))
+                    if valid_to:
+                        break
+            valid_from = None
+            found = re.search(r'Valid From:\s*(.+)', message)
+            if found:
+                valid_from = _parse_stamp(found.group(1))
+            level = None
+            level_match = re.search(r'K-index of (\d+)', headline) or re.search(r'[A-Z]+K0?(\d)', code)
+            if level_match:
+                try:
+                    level = float(level_match.group(1))
+                except Exception:
+                    level = None
+            out.append({
+                'code': code,
+                'kind': kind,
+                'headline': headline,
+                'issued_ts': int(issued.timestamp()),
+                'valid_from_ts': int(valid_from.timestamp()) if valid_from else None,
+                'valid_to_ts': int(valid_to.timestamp()) if valid_to else None,
+                'level': level,
+                'active': bool(valid_to and valid_to > now),
+            })
+        out.sort(key=lambda a: a['issued_ts'], reverse=True)
+        return out
+
+    def relevant_alerts(self, alerts: List[dict]) -> List[dict]:
+        """Alerts worth showing at this latitude and threshold."""
+        floor = max(4.0, self.kp_threshold - 1.0)
+        keep = []
+        for alert in alerts:
+            level = alert.get('level')
+            if isinstance(level, (int, float)) and float(level) < floor:
+                continue
+            if alert.get('kind', '').startswith('CANCEL'):
+                continue
+            keep.append(alert)
+        return keep
+
     def fetch_swpc_hemi_power(self) -> Optional[dict]:
         """Fetch hemispheric power (GW). Parse current SWPC tabular feed (observation + forecast + north + south).
         Returns latest dict with: timestamp (observation time), forecast_timestamp, north_gw, south_gw, total_gw.
@@ -662,6 +886,10 @@ class ForecastEngine:
         gfz_kp: Optional[float] = None,
         swpc_kp: Optional[float] = None,
         hemi_power: Optional[float] = None,
+        sun_altitude: Optional[float] = None,
+        moon_factor: Optional[float] = None,
+        cloud_low: Optional[float] = None,
+        solar_wind_drive: Optional[float] = None,
     ) -> int:
         """Combined visibility percentage using multiple signals.
         Design goal: avoid hard 0% from any single source (e.g., Ovation=0) while still reflecting conditions.
@@ -681,16 +909,28 @@ class ForecastEngine:
             effective_kp = max(effective_kp, float(swpc_kp))
         # Core multiplicative base
         kp_factor = max(0.0, min(1.0, effective_kp / 9.0))
-        cloud_factor = 1.0 if cloud_avg is None else max(0.0, 1.0 - (cloud_avg / 100.0))
-        dark_factor = 1.0
-        if isinstance(sky_darkness, str):
+        # Low cloud blocks the view outright; high cirrus only dims it.
+        if isinstance(cloud_low, (int, float)):
+            blocking = max(float(cloud_low), float(cloud_avg or 0) * 0.6)
+        else:
+            blocking = float(cloud_avg) if cloud_avg is not None else None
+        cloud_factor = 1.0 if blocking is None else max(0.0, 1.0 - (blocking / 100.0))
+
+        # Computed sun altitude beats a scraped label, and it is free.
+        if isinstance(sun_altitude, (int, float)):
+            dark_factor = astro.darkness_factor(float(sun_altitude))
+        elif isinstance(sky_darkness, str):
             key = sky_darkness.strip().lower()
             if 'day' in key:
-                dark_factor = 0.25
+                dark_factor = 0.0
             elif 'twilight' in key:
                 dark_factor = 0.6
             else:
                 dark_factor = 1.0
+        else:
+            dark_factor = 1.0
+        if isinstance(moon_factor, (int, float)):
+            dark_factor *= max(0.0, min(1.0, float(moon_factor)))
         lat_factor = self._latitude_factor(effective_kp)
         hemi_weight = 1.0
         if isinstance(hemi_power, (int, float)):
@@ -710,9 +950,192 @@ class ForecastEngine:
 
         ovation_weight = soft_weight(ovation_prob, floor=0.25)
         maf_weight = soft_weight(maf_prob, floor=0.5)
+        # Southward Bz is the driver; north Bz suppresses activity outright.
+        wind_weight = 1.0
+        if isinstance(solar_wind_drive, (int, float)):
+            wind_weight = 0.7 + 0.6 * max(0.0, min(1.0, float(solar_wind_drive)))
 
-        score = base * ovation_weight * maf_weight
+        score = base * ovation_weight * maf_weight * wind_weight
         return max(0, min(100, int(round(100.0 * score))))
+
+    def compute_viewable_windows(
+        self,
+        detections: List[Detection],
+        cloud_detail: Dict[datetime, Dict[str, int]],
+        now_utc: Optional[datetime] = None,
+        ovation_prob: Optional[int] = None,
+        maf_prob: Optional[int] = None,
+        gfz_kp: Optional[float] = None,
+        swpc_kp: Optional[float] = None,
+        hemi_power: Optional[float] = None,
+        wind_drive: Optional[float] = None,
+    ) -> Tuple[List[dict], Optional[str]]:
+        """Intersect above-threshold Kp windows with darkness and cloud cover.
+
+        A Kp 7 window at noon under overcast is not a viewing opportunity. This
+        returns only the spans where you could actually see something, plus a
+        plain reason when nothing qualifies.
+        """
+        now_utc = now_utc or datetime.now(timezone.utc)
+        upcoming = [d for d in detections if d.end_ts > int(now_utc.timestamp())]
+        if not upcoming:
+            return [], None
+
+        blocked_by_daylight = 0
+        blocked_by_cloud = 0
+        windows: List[dict] = []
+
+        for det in upcoming:
+            start = datetime.fromtimestamp(det.start_ts, tz=timezone.utc)
+            end = datetime.fromtimestamp(det.end_ts, tz=timezone.utc)
+            if end <= now_utc:
+                continue
+            # Darkness is computed over the whole block, not the part still
+            # ahead of us, so the window identity stays stable as time passes.
+            dark_spans = astro.dark_intervals(start, end, self.latitude, self.longitude)
+            if not dark_spans:
+                blocked_by_daylight += 1
+                continue
+            for span_start, span_end in dark_spans:
+                if span_end <= now_utc:
+                    continue
+                if (span_end - span_start).total_seconds() < 900:
+                    continue
+                token = f"VIEW:{int(span_start.timestamp())}:{int(span_end.timestamp())}"
+                span_start = max(span_start, now_utc)
+                if (span_end - span_start).total_seconds() < 300:
+                    continue
+                mid = span_start + (span_end - span_start) / 2
+                clouds = self._clouds_for_span(cloud_detail, span_start, span_end)
+                sky = astro.sky_conditions(mid, self.latitude, self.longitude)
+                score = self.visibility_percent(
+                    kp=det.kp,
+                    cloud_avg=clouds.get('total'),
+                    ovation_prob=ovation_prob,
+                    maf_prob=maf_prob,
+                    gfz_kp=gfz_kp,
+                    swpc_kp=swpc_kp,
+                    hemi_power=hemi_power,
+                    sun_altitude=float(sky['sun_altitude']),
+                    moon_factor=float(sky['moon_factor']),
+                    cloud_low=clouds.get('low'),
+                    solar_wind_drive=wind_drive,
+                )
+                blocking = clouds.get('low')
+                if blocking is None:
+                    blocking = clouds.get('total')
+                if isinstance(blocking, (int, float)) and blocking > self.cloud_cover_partial_max:
+                    blocked_by_cloud += 1
+                    continue
+                windows.append({
+                    'token': token,
+                    'start_ts': int(span_start.timestamp()),
+                    'end_ts': int(span_end.timestamp()),
+                    'kp': det.kp,
+                    'score': score,
+                    'cloud_total': clouds.get('total'),
+                    'cloud_low': clouds.get('low'),
+                    'moon_illumination': sky['moon_illumination'],
+                    'moon_altitude': sky['moon_altitude'],
+                    'moon_phase': sky['moon_phase'],
+                    'darkness': sky['darkness'],
+                })
+
+        windows.sort(key=lambda w: w['start_ts'])
+        windows = self._merge_windows(windows)
+        if windows:
+            return windows, None
+
+        if blocked_by_cloud and not blocked_by_daylight:
+            reason = "High Kp is forecast, but the sky is overcast for every dark hour."
+        elif blocked_by_daylight and not blocked_by_cloud:
+            reason = "High Kp is forecast, but every window falls in daylight here."
+        elif blocked_by_daylight or blocked_by_cloud:
+            reason = "High Kp is forecast, but the windows are in daylight or under cloud."
+        else:
+            reason = None
+        return [], reason
+
+    @staticmethod
+    def _merge_windows(windows: List[dict]) -> List[dict]:
+        """Join back-to-back spans into one viewing session.
+
+        Consecutive 3-hour Kp blocks on the same night read better as a single
+        "9 PM to 3 AM" window than as three separate rows.
+        """
+        merged: List[dict] = []
+        for window in windows:
+            if merged and window['start_ts'] - merged[-1]['end_ts'] <= 60:
+                prev = merged[-1]
+                prev['end_ts'] = max(prev['end_ts'], window['end_ts'])
+                prev['kp'] = max(prev['kp'], window['kp'])
+                prev['score'] = max(prev.get('score', 0), window.get('score', 0))
+                for key in ('cloud_total', 'cloud_low'):
+                    values = [w.get(key) for w in (prev, window) if isinstance(w.get(key), (int, float))]
+                    if values:
+                        prev[key] = sum(values) / len(values)
+                prev['token'] = f"{prev['token']}+{window['token'].split(':', 1)[1]}"
+                continue
+            merged.append(dict(window))
+        return merged
+
+    @staticmethod
+    def _clouds_for_span(
+        cloud_detail: Dict[datetime, Dict[str, int]],
+        start: datetime,
+        end: datetime,
+    ) -> Dict[str, Optional[float]]:
+        buckets: Dict[str, List[int]] = {'total': [], 'low': [], 'mid': [], 'high': []}
+        for ts, entry in cloud_detail.items():
+            if start <= ts < end:
+                for key, values in buckets.items():
+                    if key in entry:
+                        values.append(entry[key])
+        if not buckets['total']:
+            # Nothing inside the span; fall back to the nearest hour either side.
+            nearest = None
+            best = None
+            for ts, entry in cloud_detail.items():
+                delta = min(abs((ts - start).total_seconds()), abs((ts - end).total_seconds()))
+                if best is None or delta < best:
+                    best = delta
+                    nearest = entry
+            if nearest and best is not None and best <= 3 * 3600:
+                return {k: float(v) for k, v in nearest.items()}
+            return {'total': None, 'low': None, 'mid': None, 'high': None}
+        return {
+            key: (sum(values) / len(values) if values else None)
+            for key, values in buckets.items()
+        }
+
+    @staticmethod
+    def window_quality(score: int) -> str:
+        if score >= 45:
+            return "strong"
+        if score >= 25:
+            return "good"
+        if score >= 12:
+            return "fair"
+        return "marginal"
+
+    @staticmethod
+    def describe_window(window: dict) -> str:
+        """One readable line for a viewable window."""
+        quality = ForecastEngine.window_quality(int(window.get('score') or 0))
+        bits = [f"**<t:{window['start_ts']}:t> to <t:{window['end_ts']}:t>**"]
+        bits.append(f"Kp {float(window['kp']):.2f}")
+        bits.append(quality)
+        cloud = window.get('cloud_low')
+        if cloud is None:
+            cloud = window.get('cloud_total')
+        if isinstance(cloud, (int, float)):
+            bits.append(f"☁️ {float(cloud):.0f}%")
+        moon_alt = window.get('moon_altitude')
+        illum = window.get('moon_illumination')
+        if isinstance(moon_alt, (int, float)) and moon_alt > 0 and isinstance(illum, (int, float)):
+            bits.append(f"🌙 {float(illum) * 100:.0f}%")
+        bits.append(f"👀 {window.get('score', 0)}%")
+        return " · ".join(bits)
 
     def fetch_aurora_snapshot(self, lat: float, lon: float) -> Optional[dict]:
         url = f"https://auroraforecast.me/api/seoSnapshot?lat={lat}&lon={lon}"
@@ -1067,15 +1490,15 @@ class ForecastEngine:
             above_info = []  # keep empty; embed will show placeholder later
 
         # Enrich
-        cloud_map = self.fetch_cloud_cover()
+        cloud_detail = self.fetch_cloud_detail()
+        cloud_map = {ts: entry['total'] for ts, entry in cloud_detail.items() if 'total' in entry}
         cloud_available = bool(cloud_map)
+        solar_wind = self.fetch_solar_wind()
+        wind_drive = self.solar_wind_drive(solar_wind)
+        space_alerts = self.relevant_alerts(self.fetch_space_weather_alerts())
+        sky_now = astro.sky_conditions(now_utc, self.latitude, self.longitude)
         snapshot = self.fetch_aurora_snapshot(self.latitude, self.longitude)
-        sky_darkness = None
-        if snapshot:
-            try:
-                sky_darkness = (snapshot.get('conditions', {}) or {}).get('skyDarkness')
-            except Exception:
-                sky_darkness = None
+        sky_darkness = sky_now.get('darkness')
         # NOAA Ovation nowcast probability at location
         ovation_prob = self.fetch_ovation_probability(self.latitude, self.longitude)
         # My Aurora Forecast data
@@ -1122,6 +1545,10 @@ class ForecastEngine:
                 end_time_utc = end_time_utc + timedelta(days=1)
             start_ts = int(start_time_utc.timestamp())
             end_ts = int(end_time_utc.timestamp())
+            det_mid = start_time_utc + (end_time_utc - start_time_utc) / 2
+            det_sky = astro.sky_conditions(det_mid, self.latitude, self.longitude)
+            det_clouds = self._clouds_for_span(cloud_detail, start_time_utc, end_time_utc)
+            det_cloud_low = det_clouds.get('low')
             # cloud avg
             cloud_avg_display = "N/A"
             vis_pct = 0
@@ -1139,7 +1566,7 @@ class ForecastEngine:
                 if values:
                     avg = sum(values) / float(len(values))
                     cloud_avg_display = f"{avg:.0f}%"
-                    vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total)
+                    vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                 else:
                     # No datapoints fell inside the window; try nearest neighbor at start or end within +/- 180 minutes
                     nearest_vals = []
@@ -1159,7 +1586,7 @@ class ForecastEngine:
                     if nearest_vals:
                         avg = sum(nearest_vals) / float(len(nearest_vals))
                         cloud_avg_display = f"{avg:.0f}%"
-                        vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total)
+                        vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                     else:
                         # As a last resort, try OpenWeather specifically for this window even if Open-Meteo had partial data
                         try:
@@ -1176,11 +1603,11 @@ class ForecastEngine:
                         if ow_vals:
                             avg = sum(ow_vals) / float(len(ow_vals))
                             cloud_avg_display = f"{avg:.0f}%"
-                            vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total)
+                            vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                         else:
-                            vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total)
+                            vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
             else:
-                vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total)
+                vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
             local_date_label = f"<t:{start_ts}:D>"
             # Build bullet with UT block label and localized Discord timestamps for the time range
             ut_label = time_block
@@ -1194,6 +1621,26 @@ class ForecastEngine:
                 f"KP {kp:.2f} • ☁️ {cloud_avg_display} • 👀 {vis_pct}%"
             )
             detections.append(Detection(day_label, day_date, time_block, kp, start_ts, end_ts, cloud_avg_display, vis_pct, local_date_label, bullet))
+
+        viewable_windows, no_viewable_reason = self.compute_viewable_windows(
+            detections,
+            cloud_detail,
+            now_utc=now_utc,
+            ovation_prob=ovation_prob,
+            maf_prob=maf_prob,
+            gfz_kp=gfz_latest_value,
+            swpc_kp=swpc_effective_kp,
+            hemi_power=hemi_total,
+            wind_drive=wind_drive,
+        )
+        viewable_lines = [self.describe_window(w) for w in viewable_windows]
+
+        alert_lines_out: List[str] = []
+        for alert in space_alerts[:3]:
+            label = f"{alert['kind'].title()}: {alert['headline']}"
+            if alert.get('valid_to_ts'):
+                label += f" · until <t:{alert['valid_to_ts']}:t>"
+            alert_lines_out.append(label)
 
         window_id = f"{day_dates[0].isoformat()}_to_{day_dates[-1].isoformat()}_kp>={self.kp_threshold}"
         # Build a concise My Aurora Forecast summary if available
@@ -1301,6 +1748,9 @@ class ForecastEngine:
             now_lines.append(f"**Kp {float(swpc_effective_kp):.2f}** ({kind}) · {self.kp_activity_label(float(swpc_effective_kp))}")
         elif isinstance(gfz_latest_value, (int, float)):
             now_lines.append(f"**Kp {float(gfz_latest_value):.2f}** (GFZ) · {self.kp_activity_label(float(gfz_latest_value))}")
+        wind_line = self.solar_wind_line(solar_wind)
+        if wind_line:
+            now_lines.append(wind_line)
         detail_bits: List[str] = []
         if isinstance(ovation_prob, int):
             detail_bits.append(f"Ovation {ovation_prob}%")
@@ -1323,12 +1773,18 @@ class ForecastEngine:
                 cloud_now_val = int(round(float(candidate)))
         if isinstance(cloud_now_val, int):
             detail_bits.append(f"☁️ {cloud_now_val}%")
-        if isinstance(sky_darkness, str) and sky_darkness:
-            detail_bits.append(f"Sky {sky_darkness}")
+        detail_bits.append(str(sky_now.get('darkness')))
+        moon_alt_now = sky_now.get('moon_altitude')
+        if isinstance(moon_alt_now, (int, float)) and moon_alt_now > 0:
+            detail_bits.append(
+                f"{sky_now.get('moon_phase')} {float(sky_now.get('moon_illumination') or 0) * 100:.0f}% up"
+            )
         if detail_bits:
             now_lines.append(" · ".join(detail_bits))
 
         sources_ok = {
+            'solar_wind': isinstance(solar_wind, dict),
+            'swpc_alerts': bool(space_alerts) or isinstance(space_alerts, list),
             'noaa_forecast': True,
             'gfz': bool(gfz_records),
             'swpc_planetary': isinstance(swpc_planetary, dict),
@@ -1519,6 +1975,14 @@ class ForecastEngine:
             now_lines=now_lines,
             forecast_columns=forecast_columns,
             sources_ok=sources_ok,
+            viewable_windows=viewable_windows,
+            viewable_lines=viewable_lines,
+            no_viewable_reason=no_viewable_reason,
+            solar_wind=solar_wind,
+            solar_wind_line=self.solar_wind_line(solar_wind),
+            alerts=space_alerts,
+            alert_lines=alert_lines_out,
+            sky_now=sky_now,
         )
 
     @staticmethod

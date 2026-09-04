@@ -10,6 +10,8 @@ This repo now includes a Discord bot that posts and updates an aurora forecast m
   - `/aurora-set-location` – set latitude/longitude and a display name
   - `/aurora-start` – post the initial embed
   - `/aurora-show` – preview current content ephemerally
+- Works out **when you can actually see it**, by intersecting above-threshold Kp
+  windows with local darkness and cloud cover, and says why when nothing lines up
 - Background updater runs every 2 hours (configurable via `UPDATE_INTERVAL_HOURS`), retrying after `UPDATE_RETRY_MINUTES` if a cycle fails
 - When a new 3-day forecast window meets or exceeds your threshold, the bot sends an extra ephemeral alert message listing only the newly added high-Kp window(s); this auto-deletes after a configurable delay
 - Uses SQLite for persistent per-guild configuration (`data/aurora.db`)
@@ -65,6 +67,30 @@ The container uses `python -m aurora.bot` directly; legacy cron + `noaa alert.py
 - `/aurora-refresh` – rebuild the tracked embed now
 - `/aurora-stop` – stop updates in this server
 - `/aurora-health` – per-source status of every upstream feed
+
+## Data sources
+
+| Source | Used for |
+| --- | --- |
+| NOAA SWPC 3-day forecast | Kp per 3-hour block |
+| SWPC planetary K, 1-minute | Current Kp |
+| SWPC propagated solar wind | Bz, speed, density at Earth |
+| SWPC alerts | Official geomagnetic watches and warnings |
+| SWPC Ovation, hemispheric power | Nowcast probability and energy input |
+| GFZ Potsdam | Independent Kp series |
+| Open-Meteo | Cloud cover split into low, mid and high |
+| Computed locally | Sun altitude, moon phase and altitude, geomagnetic latitude |
+
+Solar wind is the only feed that leads rather than lags. Kp is a three-hour average
+published after the fact, while southward Bz at L1 drives the substorm that follows.
+Sun and moon positions are computed from latitude, longitude and time, so they cost
+no network call and cannot break when a third-party site goes down.
+
+Auroral oval boundaries are quoted in geomagnetic latitude, which in North America
+runs several degrees higher than geographic. Portland sits at 45.5 degrees
+geographic but 51.0 degrees geomagnetic, so comparing the two directly understated
+every score. Positions use a centered dipole, accurate to about a degree in North
+America and less so near the eccentric-dipole extremes.
 
 ## Reliability
 

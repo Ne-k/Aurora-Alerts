@@ -101,7 +101,7 @@ HEARTBEAT_PATH = os.path.abspath(
 )
 
 REQUIRED_SOURCES = ["noaa_forecast", "gfz", "swpc_planetary"]
-OPTIONAL_SOURCES = ["cloud_cover", "ovation", "maf", "afm_snapshot", "swpc_hemi"]
+OPTIONAL_SOURCES = ["solar_wind", "swpc_alerts", "cloud_cover", "ovation", "maf", "afm_snapshot", "swpc_hemi"]
 
 def _engine_for_guild(cfg: Optional[dict]) -> ForecastEngine:
     if not cfg:
@@ -138,6 +138,8 @@ async def perform_startup_health(engine: ForecastEngine) -> dict:
         safe_call('afm_raw', _run_blocking(engine.fetch_aurora_snapshot, engine.latitude, engine.longitude, timeout=STARTUP_HEALTH_TIMEOUT)),
         safe_call('swpc_planetary_raw', _run_blocking(engine.fetch_swpc_planetary_k_latest, timeout=STARTUP_HEALTH_TIMEOUT)),
         safe_call('swpc_hemi_raw', _run_blocking(engine.fetch_swpc_hemi_power, timeout=STARTUP_HEALTH_TIMEOUT)),
+        safe_call('solar_wind_raw', _run_blocking(engine.fetch_solar_wind, timeout=STARTUP_HEALTH_TIMEOUT)),
+        safe_call('alerts_raw', _run_blocking(engine.fetch_space_weather_alerts, timeout=STARTUP_HEALTH_TIMEOUT)),
     )
     swpc_planetary_raw = results.get('swpc_planetary_raw')
     swpc_planetary_ok = False
@@ -155,6 +157,8 @@ async def perform_startup_health(engine: ForecastEngine) -> dict:
         'afm_snapshot': isinstance(results.get('afm_raw'), dict) and 'tonight' in (results.get('afm_raw') or {}),
         'swpc_planetary': swpc_planetary_ok,
         'swpc_hemi': isinstance(results.get('swpc_hemi_raw'), dict),
+        'solar_wind': isinstance(results.get('solar_wind_raw'), dict),
+        'swpc_alerts': isinstance(results.get('alerts_raw'), list),
         'checked_at': int(started.timestamp()),
     }
     failed = [k for k in REQUIRED_SOURCES + OPTIONAL_SOURCES if k in health and not health[k]]
@@ -257,8 +261,25 @@ def format_embed(
             embed.set_image(url=main_image)
         if tonight_busted and tomorrow_busted and tomorrow_busted != tonight_busted:
             embed.set_thumbnail(url=tomorrow_busted)
-    # Tonight's call, in one line, before the raw numbers.
-    if build and build.recommendation_lines:
+    # When you could actually see it. This is the whole point, so it goes first.
+    if build and build.viewable_lines:
+        value = "\n".join(f"• {line}" for line in build.viewable_lines[:5])
+        if len(build.viewable_lines) > 5:
+            value += f"\n• plus {len(build.viewable_lines) - 5} more"
+        embed.add_field(name="🌌 When to look", value=value[:1024], inline=False)
+    elif build and build.no_viewable_reason:
+        embed.add_field(name="🌌 When to look", value=build.no_viewable_reason[:1024], inline=False)
+
+    if build and build.alert_lines:
+        embed.add_field(
+            name="NOAA space weather alerts",
+            value="\n".join(f"• {line}" for line in build.alert_lines[:3])[:1024],
+            inline=False,
+        )
+
+    # Only worth showing when there is no concrete window to point at, otherwise
+    # it repeats or contradicts the field above.
+    if build and build.recommendation_lines and not build.viewable_lines and not build.no_viewable_reason:
         embed.add_field(name="Tonight", value=build.recommendation_lines[0][:1024], inline=False)
 
     # 3-day NOAA table as three side-by-side columns, one per day. The old
@@ -358,6 +379,85 @@ async def _find_latest_bot_embed(channel: discord.TextChannel) -> Optional[disco
         pass
     return None
 
+def _detection_signature(build: Optional[AlertBuild]) -> str:
+    """Stable token set describing what is worth alerting on.
+
+    SWPC tokens cover "a storm is happening now". VIEW tokens cover "there is a
+    span tonight when you could actually see it", so a newly viewable window
+    fires a notification even when the Kp reading has not changed.
+    """
+    if not build:
+        return ''
+    tokens: List[str] = []
+    try:
+        for blk in getattr(build, 'swpc_high_blocks', None) or []:
+            if not isinstance(blk, dict):
+                continue
+            ts, kp = blk.get('ts'), blk.get('kp')
+            if isinstance(ts, int) and isinstance(kp, (int, float)):
+                tokens.append(f"SWPC:{ts}:{kp}")
+        if not tokens and isinstance(getattr(build, 'swpc_high_block', None), dict):
+            ts = build.swpc_high_block.get('ts')
+            kp = build.swpc_high_block.get('kp')
+            if isinstance(ts, int) and isinstance(kp, (int, float)):
+                tokens.append(f"SWPC:{ts}:{kp}")
+        for window in (build.viewable_windows or []):
+            # Uses the unclamped token so an in-progress window keeps its
+            # identity as the clock moves and does not re-alert every cycle.
+            token = window.get('token')
+            if isinstance(token, str) and token:
+                tokens.append(token)
+    except Exception:
+        logging.debug("Failed building detection signature", exc_info=True)
+    return '|'.join(sorted(tokens))
+
+
+def compose_alert_message(
+    build: Optional[AlertBuild],
+    engine: Optional[ForecastEngine],
+    added_tokens: List[str],
+) -> Optional[str]:
+    """The notification body. Leads with when you can actually see it."""
+    if not build:
+        return None
+    threshold = engine.kp_threshold if engine else DEFAULT_KP
+    location = engine.location_name if engine else DEFAULT_LOC
+    windows = build.viewable_windows or []
+    new_view = [t for t in added_tokens if t.startswith('VIEW:')]
+    new_swpc = [t for t in added_tokens if t.startswith('SWPC:')]
+
+    lines: List[str] = []
+    if windows:
+        best = max(int(w.get('score') or 0) for w in windows)
+        quality = ForecastEngine.window_quality(best)
+        headline = "🌌 Aurora may be visible" if new_view else "⚠️ High Kp detected"
+        lines.append(f"**{headline} from {location}** · best odds {quality}")
+        lines.append("")
+        lines.append("**When to look:**")
+        for window in windows[:4]:
+            lines.append(f"• {ForecastEngine.describe_window(window)}")
+        if len(windows) > 4:
+            lines.append(f"• plus {len(windows) - 4} more window(s)")
+    elif new_swpc:
+        lines.append(f"**⚠️ High Kp detected (≥ {threshold:g}) near {location}**")
+        reason = build.no_viewable_reason
+        lines.append(reason or "No dark, clear window lines up with it right now.")
+    else:
+        return None
+
+    if build.solar_wind_line:
+        lines.append("")
+        lines.append(f"Solar wind: {build.solar_wind_line}")
+    if build.alert_lines:
+        lines.append(f"NOAA: {build.alert_lines[0]}")
+    elif build.aggregated_sources_line:
+        lines.append(build.aggregated_sources_line)
+
+    lines.append("")
+    lines.append(f"_Auto-deletes in {ALERT_DELETE_AFTER_MINUTES} min._")
+    return "\n".join(lines)[:1900]
+
+
 async def build_update_for_guild(
     guild: discord.Guild, cfg: Optional[dict] = None
 ) -> tuple[str, str, str, str, str, Optional[ForecastEngine], Optional[AlertBuild]]:
@@ -380,28 +480,7 @@ async def build_update_for_guild(
     tonight_url = build.tonight_image_url if build else ''
     tomorrow_url = build.tomorrow_image_url if build else ''
     window_id = build.window_id if build else ''
-    # Build detection signature from NOAA SWPC real-time data only to reduce false positives.
-    det_sig = ''
-    if build:
-        tokens: List[str] = []
-        try:
-            swpc_blocks = getattr(build, 'swpc_high_blocks', None)
-            if swpc_blocks:
-                for blk in swpc_blocks:
-                    ts = blk.get('ts') if isinstance(blk, dict) else None
-                    kp = blk.get('kp') if isinstance(blk, dict) else None
-                    if isinstance(ts, int) and isinstance(kp, (int, float)):
-                        tokens.append(f"SWPC:{ts}:{kp}")
-            elif build.swpc_high_block:
-                ts = build.swpc_high_block.get('ts') if isinstance(build.swpc_high_block, dict) else None
-                kp = build.swpc_high_block.get('kp') if isinstance(build.swpc_high_block, dict) else None
-                if isinstance(ts, int) and isinstance(kp, (int, float)):
-                    tokens.append(f"SWPC:{ts}:{kp}")
-        except Exception:
-            pass
-        if tokens:
-            # Sort tokens for stable ordering
-            det_sig = '|'.join(sorted(tokens))
+    det_sig = _detection_signature(build)
     return content, tonight_url, tomorrow_url, window_id, det_sig, engine, build
 
 async def _auto_delete(message: discord.Message, minutes: int):
@@ -878,82 +957,24 @@ async def _run_update_cycle() -> bool:
                 if not prev:
                     await set_last_window(guild.id, combined_id, ts_now)
                 elif combined_id != prev:
-                    old_sig = ''
-                    if '|' in prev:
-                        old_sig = prev.split('|', 1)[1]
-                    old_tokens = set(t for t in old_sig.split('|') if t)
-                    new_tokens = set(t for t in det_sig.split('|') if t)
-                    added = [t for t in new_tokens if t not in old_tokens]
+                    old_sig = prev.split('|', 1)[1] if '|' in prev else ''
+                    old_tokens = {t for t in old_sig.split('|') if t}
+                    new_tokens = {t for t in det_sig.split('|') if t}
+                    added = sorted(new_tokens - old_tokens)
                     if added:
-                        alert_lines: List[str] = []
-                        swpc_block_map: dict[str, dict] = {}
-                        swpc_blocks_all = getattr(build, 'swpc_high_blocks', None) or []
-                        for blk in swpc_blocks_all:
-                            ts_val = blk.get('ts') if isinstance(blk, dict) else None
-                            kp_val = blk.get('kp') if isinstance(blk, dict) else None
-                            if isinstance(ts_val, int) and isinstance(kp_val, (int, float)):
-                                swpc_block_map[f"SWPC:{ts_val}:{kp_val}"] = blk
-                        for t in added:
-                            blk = swpc_block_map.get(t)
-                            if not blk and t.startswith('SWPC:'):
-                                # Fallback to parse token directly
-                                try:
-                                    _, ts_str, kp_str = t.split(':', 2)
-                                    blk = {'ts': int(float(ts_str)), 'kp': float(kp_str)}
-                                except Exception:
-                                    blk = None
-                            if not isinstance(blk, dict):
-                                continue
-                            ts_val = blk.get('ts') if isinstance(blk.get('ts'), int) else None
-                            kp_val = blk.get('kp') if isinstance(blk.get('kp'), (int, float)) else None
-                            if ts_val is None or kp_val is None:
-                                continue
-                            kind = blk.get('kind') if isinstance(blk.get('kind'), str) else ''
-                            kind_note = ' (est)' if kind == 'estimated' else ''
-                            alert_lines.append(f"SWPC Planetary Kp {kp_val:.2f}{kind_note} at <t:{ts_val}:t>")
-                        if alert_lines:
-                            threshold_display = engine.kp_threshold if engine else DEFAULT_KP
-                            header = f"⚠️ High Kp detected (≥ {threshold_display})"
-                            if build and build.aggregated_sources_line:
-                                header += f"\n{build.aggregated_sources_line}"
-
-                            # Pull the best viewing windows (sorted by visibility) for quick reading
-                            window_lines: List[str] = []
-                            if build and build.detections:
-                                top = sorted(build.detections, key=lambda d: d.visibility_pct, reverse=True)[:3]
-                                for det in top:
-                                    window_lines.append(
-                                        f"<t:{det.start_ts}:t>-<t:{det.end_ts}:t> • KP {det.kp:.2f} • 👀 {det.visibility_pct}%"
-                                    )
-                            else:
-                                # Fallback to the raw SWPC alert tokens if no detections are present
-                                window_lines = [str(x) for x in alert_lines if isinstance(x, str)][:3]
-
-                            alert_text = header
-                            if window_lines:
-                                alert_text += "\nBest windows:\n" + "\n".join(window_lines)
-
-                            def _bust(url: str) -> str:
-                                if not url:
-                                    return url
-                                interval_min = int(os.getenv('IMAGE_CACHE_BUST_INTERVAL_MIN', '30') or '30')
-                                if interval_min < 1:
-                                    interval_min = 1
-                                token = int(ts_now // (interval_min * 60))
-                                sep = '&' if ('?' in url) else '?'
-                                return f"{url}{sep}v={token}"
-
-                            if tonight_url:
-                                alert_text += f"\nTonight image: {_bust(tonight_url)}"
-                            if tomorrow_url and tomorrow_url != tonight_url:
-                                alert_text += f"\nTomorrow image: {_bust(tomorrow_url)}"
-
-                            alert_text += f"\n_(Will auto-delete in {ALERT_DELETE_AFTER_MINUTES} min)_"
+                        alert_text = compose_alert_message(build, engine, added)
+                        if alert_text:
                             try:
                                 alert_msg = await channel.send(alert_text)
                                 asyncio.create_task(_auto_delete(alert_msg, ALERT_DELETE_AFTER_MINUTES))
+                                logging.info(
+                                    "Guild %s: sent alert for %d new window(s)/reading(s).",
+                                    guild.id, len(added),
+                                )
+                            except discord.Forbidden:
+                                logging.warning("Guild %s: cannot post alert, missing permissions.", guild.id)
                             except Exception:
-                                logging.exception("Failed to send high-Kp alert message")
+                                logging.exception("Failed to send aurora alert message")
                     await set_last_window(guild.id, combined_id, ts_now)
         except Exception as e:
             all_ok = False
