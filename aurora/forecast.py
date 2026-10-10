@@ -172,7 +172,8 @@ class ForecastEngine:
         }
         for i, t_str in enumerate(times):
             try:
-                dt = datetime.fromisoformat(str(t_str).replace('Z', '+00:00')).astimezone(timezone.utc)
+                dt = datetime.fromisoformat(str(t_str).replace('Z', '+00:00'))
+                dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)  # timezone=UTC tags are naive
             except Exception:
                 continue
             entry: Dict[str, int] = {}
@@ -404,7 +405,7 @@ class ForecastEngine:
             best_d2 = 1e18
             for flat, flon, p in candidates:
                 dlat = flat - lat
-                dlon = (flon - lon) * (0.5 if abs(lat) < 60 else 1.0)  # coarse lon scaling
+                dlon = ((flon - lon + 180) % 360 - 180) * math.cos(math.radians(flat))  # wrap-safe: grid is 0..359E
                 d2 = dlat*dlat + dlon*dlon
                 if d2 < best_d2:
                     best_d2 = d2
@@ -561,22 +562,26 @@ class ForecastEngine:
         # Exponential decay keeps a soft floor while penalizing large latitude gaps
         return max(0.05, math.exp(-diff / 6.0))
 
+    def latest_hp30(self) -> Optional[float]:
+        """Latest GFZ Hp30 (30-minute, same scale as Kp but open-ended); reacts faster than the 3-hour Kp."""
+        end = datetime.now(timezone.utc)
+        recs, _ = self.fetch_gfz_series(end - timedelta(hours=3), end, index='Hp30')
+        return recs[-1].value if recs else None
+
     def gfz_recent_blocks(self, hours_back: int = 72) -> dict:
         hours_window = max(3, min(240, int(hours_back)))
         end = datetime.now(timezone.utc)
         start = end - timedelta(hours=hours_window)
         records, meta = self.fetch_gfz_series(start, end)
-        local_tz = pytz.timezone(self.timezone_name)
         rows = []
         for rec in records:
             ts = int(rec.timestamp.timestamp())
-            local_dt = rec.timestamp.astimezone(local_tz)
             rows.append({
                 'ts': ts,
                 'kp': round(rec.value, 3),
                 'status': rec.status,
                 'status_label': self._gfz_status_label(rec.status),
-                'local_label': local_dt.strftime('%b %d %H:%M'),
+                'local_label': f"<t:{ts}:f>",
             })
         latest = rows[-1] if rows else None
         source_note = None
@@ -1255,6 +1260,7 @@ class ForecastEngine:
 
         kp_for_calc = maf_kp if isinstance(maf_kp, (int, float)) else max(self.kp_threshold, 5.0)
 
+        hp30 = self.latest_hp30()
         points = []
         for delta_min in range(0, minutes + 1, step):
             ts = int((now_utc + timedelta(minutes=delta_min)).timestamp())
@@ -1264,7 +1270,7 @@ class ForecastEngine:
                 ovation_prob=ovation_prob,
                 sky_darkness=sky_darkness,
                 maf_prob=maf_prob,
-                gfz_kp=gfz_latest.value if gfz_latest else None,
+                gfz_kp=max((v for v in (gfz_latest.value if gfz_latest else None, hp30) if v is not None), default=None),
                 swpc_kp=swpc_kp_latest if isinstance(swpc_kp_latest, (int, float)) else swpc_est_kp,
                 hemi_power=hemi_total,
             )
@@ -1407,6 +1413,7 @@ class ForecastEngine:
         gfz_latest_line: Optional[str] = None
         gfz_source_note: Optional[str] = None
         gfz_latest_value: Optional[float] = None
+        hp30 = self.latest_hp30()
         if gfz_records:
             gfz_latest = gfz_records[-1]
             gfz_latest_value = gfz_latest.value
@@ -1420,7 +1427,7 @@ class ForecastEngine:
                     continue  # suppress below-threshold noise
                 ts = int(rec.timestamp.timestamp())
                 gfz_summary_lines.append(
-                    f"• <t:{ts}:t> • Kp {rec.value:.2f} ({self._gfz_status_label(rec.status)})"
+                    f"• <t:{ts}:f> • Kp {rec.value:.2f} ({self._gfz_status_label(rec.status)})"
                 )
             # If nothing met threshold, keep at least one contextual line (last record before latest)
             if not gfz_summary_lines:
@@ -1428,7 +1435,7 @@ class ForecastEngine:
                 for rec in fallback_slice:
                     ts = int(rec.timestamp.timestamp())
                     gfz_summary_lines.append(
-                        f"• <t:{ts}:t> • Kp {rec.value:.2f} ({self._gfz_status_label(rec.status)})"
+                        f"• <t:{ts}:f> • Kp {rec.value:.2f} ({self._gfz_status_label(rec.status)})"
                     )
         if isinstance(gfz_meta, dict):
             source = gfz_meta.get('source')
@@ -1536,6 +1543,7 @@ class ForecastEngine:
 
         detections: List[Detection] = []  # retained for embed display (forecast windows)
         utc = pytz.utc
+        day_first_ts: Dict[date, int] = {}
         for day_label, day_date, time_block, kp in above_info:
             start_hour = int(time_block.split('-')[0])
             end_hour = int(time_block.split('-')[1][:2])
@@ -1566,7 +1574,7 @@ class ForecastEngine:
                 if values:
                     avg = sum(values) / float(len(values))
                     cloud_avg_display = f"{avg:.0f}%"
-                    vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
+                    vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=max((v for v in (gfz_latest_value, hp30) if v is not None), default=None), swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                 else:
                     # No datapoints fell inside the window; try nearest neighbor at start or end within +/- 180 minutes
                     nearest_vals = []
@@ -1586,7 +1594,7 @@ class ForecastEngine:
                     if nearest_vals:
                         avg = sum(nearest_vals) / float(len(nearest_vals))
                         cloud_avg_display = f"{avg:.0f}%"
-                        vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
+                        vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=max((v for v in (gfz_latest_value, hp30) if v is not None), default=None), swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                     else:
                         # As a last resort, try OpenWeather specifically for this window even if Open-Meteo had partial data
                         try:
@@ -1603,12 +1611,12 @@ class ForecastEngine:
                         if ow_vals:
                             avg = sum(ow_vals) / float(len(ow_vals))
                             cloud_avg_display = f"{avg:.0f}%"
-                            vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
+                            vis_pct = self.visibility_percent(kp, avg, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=max((v for v in (gfz_latest_value, hp30) if v is not None), default=None), swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
                         else:
-                            vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
+                            vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=max((v for v in (gfz_latest_value, hp30) if v is not None), default=None), swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
             else:
-                vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=gfz_latest_value, swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
-            local_date_label = f"<t:{start_ts}:D>"
+                vis_pct = self.visibility_percent(kp, None, ovation_prob=ovation_prob, sky_darkness=sky_darkness, maf_prob=maf_prob, gfz_kp=max((v for v in (gfz_latest_value, hp30) if v is not None), default=None), swpc_kp=swpc_effective_kp, hemi_power=hemi_total, sun_altitude=det_sky['sun_altitude'], moon_factor=det_sky['moon_factor'], cloud_low=det_cloud_low, solar_wind_drive=wind_drive)
+            local_date_label = f"<t:{day_first_ts.setdefault(day_date, start_ts)}:D>"  # one header per UT day
             # Build bullet with UT block label and localized Discord timestamps for the time range
             ut_label = time_block
             try:
@@ -1617,7 +1625,7 @@ class ForecastEngine:
             except Exception:
                 pass
             bullet = (
-                f"• {ut_label} → <t:{start_ts}:t> - <t:{end_ts}:t> • "
+                f"• {ut_label} → <t:{start_ts}:f> - <t:{end_ts}:t> • "
                 f"KP {kp:.2f} • ☁️ {cloud_avg_display} • 👀 {vis_pct}%"
             )
             detections.append(Detection(day_label, day_date, time_block, kp, start_ts, end_ts, cloud_avg_display, vis_pct, local_date_label, bullet))
@@ -1873,7 +1881,7 @@ class ForecastEngine:
                 extras.append(f"Ovation {ovation_prob}%")
             if isinstance(maf_prob, int):
                 extras.append(f"MAF {maf_prob}%")
-            rng = f"<t:{best_next.start_ts}:t>-<t:{best_next.end_ts}:t>"
+            rng = f"<t:{best_next.start_ts}:f>-<t:{best_next.end_ts}:t>"
             line = (
                 f"Tonight: {label} ({combined}%). Best window {best_next.ut_block} ({rng}) • "
                 f"KP {best_next.kp:.2f} • ☁️ {best_next.cloud_avg_display}"

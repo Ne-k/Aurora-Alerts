@@ -850,7 +850,7 @@ async def gfz_hourly_cmd(interaction: discord.Interaction, hours_back: int = 72)
             kp_val = row.get('kp')
             status_label = row.get('status_label') or row.get('status')
             if isinstance(ts, int) and isinstance(kp_val, (int, float)):
-                line = f"• <t:{ts}:t> • Kp {float(kp_val):.2f}"
+                line = f"• <t:{ts}:f> • Kp {float(kp_val):.2f}"
                 if isinstance(status_label, str) and status_label:
                     line += f" ({status_label})"
                 lines.append(line)
